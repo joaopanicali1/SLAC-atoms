@@ -1,4 +1,13 @@
 train_4M/
+orca_scratch/
+train_4M.db
+openmpi-4.1.8/
+orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg/
+openmpi-4.1.8_install/
+jupyter_gpu.slurm/
 .ipynb_checkpoints/
-phase_space_shard0.npy
-requirements.txt
+orca_scratch/
+env_orca.sh
+.gitignore
+jupyter_gpu.slurm
+jupyter_cpu.slurm

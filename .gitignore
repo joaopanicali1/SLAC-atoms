@@ -1,1 +1,4 @@
 train_4M/
+.ipynb_checkpoints/
+phase_space_shard0.npy
+requirements.txt

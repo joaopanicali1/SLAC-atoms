@@ -11,3 +11,5 @@ env_orca.sh
 .gitignore
 jupyter_gpu.slurm
 jupyter_cpu.slurm
+test_results/
+mol_data/

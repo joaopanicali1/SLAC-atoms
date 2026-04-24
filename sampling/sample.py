@@ -50,8 +50,8 @@ def bucket_sample(x, y, n_buckets_x, n_buckets_y, total_n, rng=None):
 
 def region_uniform_sample(x, y, x_min, x_max, y_min, y_max, total_n, rng=None):
     """
-    Keep only points inside [x_min, x_max] × [y_min, y_max],
-    then draw `total_n` uniformly at random.
+    Keep only points inside [x_min, x_max] by [y_min, y_max],
+    then draw total_n uniformly at random.
     """
     if rng is None:
         rng = np.random.default_rng(42)

@@ -6,8 +6,8 @@ from tqdm import tqdm
 
 features = np.load("sampling/phase_space_shard0.npy")
 
-N_atoms       = features[:, 0]
-pair_weight   = features[:, 1]
+N_atoms = features[:, 0]
+pair_weight = features[:, 1]
 
 log_pair_weight = np.log10(np.maximum(pair_weight, 1))
 
@@ -67,7 +67,7 @@ rng = np.random.default_rng(42)
 
 # Sample 1: 1k, full phase space, uniform buckets (20×20 = 400 buckets)
 print("Sample 1 – 1k full-space bucket sample")
-n_buckets = 20          # 20×20 grid -> 400 buckets; ~2-3 per bucket if all occupied
+n_buckets = 20
 idx1 = bucket_sample(log_pair_weight, N_atoms, n_buckets, n_buckets, 1_000, rng)
 print(f"  Selected {len(idx1)} molecules\n")
 
@@ -81,13 +81,13 @@ idx2 = region_uniform_sample(
 )
 print(f" Selected {len(idx2)} molecules\n")
 
-# Sample 3 : 10k, full phase space, uniform buckets (40×40 = 1600 buckets)
+# Sample 3: 10k, full phase space, uniform buckets (40×40 = 1600 buckets)
 print("Sample 3 – 10k full-space bucket sample")
 n_buckets_large = 40
 idx3 = bucket_sample(log_pair_weight, N_atoms, n_buckets_large, n_buckets_large, 10_000, rng)
 print(f"  Selected {len(idx3)} molecules\n")
 
-# --- Sample 4 : 10k, restricted region, pure uniform draw ───────────────────
+# Sample 4: 10k, restricted region, pure uniform draw
 print("Sample 4 – 10k restricted-region uniform sample")
 idx4 = region_uniform_sample(
     log_pair_weight, N_atoms,
@@ -97,14 +97,14 @@ idx4 = region_uniform_sample(
 )
 print(f"  Selected {len(idx4)} molecules\n")
 
-# ── Save index arrays ────────────────────────────────────────────────────────
+# Save index arrays
 np.save("sample_1k_fullspace_buckets.npy",    idx1)
 np.save("sample_1k_restricted_uniform.npy",   idx2)
 np.save("sample_10k_fullspace_buckets.npy",   idx3)
 np.save("sample_10k_restricted_uniform.npy",  idx4)
 print("Saved all four index arrays.")
 
-# ── Diagnostic plots ─────────────────────────────────────────────────────────
+# Diagnostic plots
 fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 titles = [
     "Sample 1 - 1k full-space buckets",

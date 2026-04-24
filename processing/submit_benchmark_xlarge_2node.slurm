@@ -17,9 +17,5 @@ export LD_LIBRARY_PATH="/home/cme290/joaop/SLAC-atoms/openmpi-4.1.8_install/lib:
 export PATH="/home/cme290/joaop/SLAC-atoms/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg:$PATH"
 export LD_LIBRARY_PATH="/home/cme290/joaop/SLAC-atoms/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg:$LD_LIBRARY_PATH"
 
-export RAM_SCRATCH=/dev/shm/${USER}_${SLURM_JOB_ID}
-mkdir -p "$RAM_SCRATCH"
-
+# Multi-node: /dev/shm is node-local; use shared FS scratch instead.
 python -u processing/benchmark.py --tier xlarge --mol-idx "$SLURM_ARRAY_TASK_ID" --mpi
-
-rm -rf "$RAM_SCRATCH"

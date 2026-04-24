@@ -15,3 +15,5 @@ mol_data/
 .DS_Store
 SLAC-atoms.code-workspace
 requirements.txt
+processing/logs
+orca_scratch_tmp

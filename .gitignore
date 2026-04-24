@@ -8,8 +8,10 @@ jupyter_gpu.slurm/
 .ipynb_checkpoints/
 orca_scratch/
 env_orca.sh
-.gitignore
 jupyter_gpu.slurm
 jupyter_cpu.slurm
 test_results/
 mol_data/
+.DS_Store
+SLAC-atoms.code-workspace
+requirements.txt

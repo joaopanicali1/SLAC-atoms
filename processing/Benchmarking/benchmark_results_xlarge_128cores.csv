@@ -1,0 +1,2 @@
+tier,mol_idx,target_atoms,actual_atoms,formula,sample_idx,nprocs,wall_min,orca_engine_min,status
+xlarge,1,72,72,C18H42N6O6,9972,128,nan,nan,FAILED: Error: Calculation did not finish!

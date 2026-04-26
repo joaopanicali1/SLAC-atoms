@@ -1,0 +1,4 @@
+tier,mol_idx,target_atoms,actual_atoms,formula,sample_idx,nprocs,wall_min,orca_engine_min,status
+xlarge,1,75,75,RuAsC25H35N3O4PS5,41622,64,nan,nan,FAILED: Error: Calculation did not finish!
+xlarge,0,55,55,Br2C15H32IN2O3,15628,64,74.34,nan,ok
+xlarge,1,72,72,C18H42N6O6,9972,64,162.85,nan,ok

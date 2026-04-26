@@ -1,0 +1,3 @@
+tier,mol_idx,target_atoms,actual_atoms,formula,sample_idx,nprocs,wall_min,orca_engine_min,status
+large,0,15,15,C2H8N4P,22891,64,nan,nan,FAILED: Error: Calculation did not finish!
+large,2,40,40,PtC11H18N3O6P,2408,64,163.53,nan,ok

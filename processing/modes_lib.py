@@ -161,7 +161,9 @@ def _save(output_npz_path, R_0, masses_amu, hess_ASE, eigenvalues, omegas_filt, 
     """
     out_dir = os.path.dirname(os.path.abspath(output_npz_path))
     os.makedirs(out_dir, exist_ok=True)
-    tmp_path = output_npz_path + ".tmp"
+    # np.savez_compressed appends .npz if the filename doesn't already end in it,
+    # so the tmp file must also end in .npz for os.replace to find the right file.
+    tmp_path = output_npz_path[:-4] + ".tmp.npz"
     np.savez_compressed(
         tmp_path,
         R_0=R_0,

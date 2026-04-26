@@ -1,0 +1,2 @@
+tier,mol_idx,target_atoms,actual_atoms,formula,sample_idx,nprocs,wall_min,orca_engine_min,status
+xlarge,2,100,100,C25ClH49N7O17S,4209,256,nan,nan,FAILED: Error: Calculation did not finish!

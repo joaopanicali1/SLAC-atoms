@@ -1,19 +1,23 @@
 #!/bin/bash
-# Tier 4 — extra-large molecules (>50 atoms): ORCA, 32 cores, 1 node per task
+# Tier 4 — extra-large molecules (>50 atoms): ORCA, 2 nodes / 64 cores per task
 #
-# WARNING: With 50-150 atoms, individual calculations may take several hours.
-# The 4-hour wall-time limit on the cpu partition may be insufficient for the
-# largest molecules (~100-150 atoms). Options if jobs time out:
-#   a) Request a longer time limit from your admin (--time=08:00:00 or more)
-#   b) Split xlarge further and allocate 2 nodes × 32 cores for the very largest
+# Benchmark results:
+#   55-atom:  74 min on 2-node
+#   72-atom: 163 min on 2-node
+#   100-atom: timed out on 2-node (complex molecule near 4-hr limit)
+#   4-node (128 cores): OUT OF MEMORY — too many MPI processes per basis function
+#   8-node (256 cores): ORCA internal error (negative matrix dims)
+# 2 nodes is the maximum that works reliably for this molecule size range.
+# Molecules near 100+ atoms may still time out; resubmit those individually.
 #
 # Update --array upper bound to (n_xlarge - 1) after running classify.py
 #SBATCH --job-name=modes_xlarge
-#SBATCH --array=0-429%17
-#SBATCH --nodes=1
+#SBATCH --array=0-429%7
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=32
 #SBATCH --time=04:00:00
 #SBATCH --partition=cpu
+#SBATCH --exclude=hpcc-cpu-11-16,hpcc-cpu-11-18
 #SBATCH --output=processing/logs/xlarge_%A_%a.out
 #SBATCH --error=processing/logs/xlarge_%A_%a.err
 

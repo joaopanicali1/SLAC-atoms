@@ -12,7 +12,7 @@ import numpy as np
 from ase.db import connect
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from modes_lib import compute_and_save_modes_orca
+from modes_lib import compute_and_save_modes_orca, ORCA_SIMPLE, ORCA_SIMPLE_OPT
 
 PROJECT_ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH       = os.path.join(PROJECT_ROOT, "train_4M", "data0000.aselmdb")
@@ -21,6 +21,8 @@ ORCA_PATH     = os.path.join(PROJECT_ROOT,
                               "orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg", "orca")
 # Use SLURM_NTASKS if available; fall back to 32
 NPROCS = int(os.environ.get("SLURM_NTASKS", os.environ.get("SLURM_NTASKS_PER_NODE", 32)))
+# Allow overriding ORCA keywords via environment variable (e.g. for retry with Opt)
+ORCA_KEYWORDS = os.environ.get("ORCA_KEYWORDS", ORCA_SIMPLE)
 
 
 def make_scratch_dir(task_id: int) -> str:
@@ -87,6 +89,7 @@ def main():
             orca_path=ORCA_PATH,
             scratch_dir=scratch_dir,
             nprocs=NPROCS,
+            orca_keywords=ORCA_KEYWORDS,
         )
         log.info(f"Success: {output_path}")
     except Exception as e:

@@ -15,7 +15,7 @@ OUT_DIR       = "processing/indices"
 #   ≤75 atoms: all completed within 4 hours (~4 days total for 725 molecules)
 #   76-150 atoms: most hit the wall time; 4+ nodes causes ORCA OOM errors
 # Set to None to process the full sample.
-MAX_ATOMS = 75
+MAX_ATOMS = 12
 # ─────────────────────────────────────────────────────────────────────────────
 
 sample_idx = np.load(SAMPLE_PATH)

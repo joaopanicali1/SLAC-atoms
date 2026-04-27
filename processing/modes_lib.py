@@ -26,13 +26,15 @@ ORCA_BASIS  = "def2-TZVPD"         # ORCA spelling (same basis set)
 # Benchmark error vs. conventional B3LYP: < 1 cm⁻¹ for harmonic frequencies
 # (typically 0.1–0.3 cm⁻¹) — negligible relative to B3LYP's ~30–50 cm⁻¹ vs. experiment.
 # def2/J is the Weigend Coulomb-fitting auxiliary basis, standard with RIJCOSX.
-ORCA_SIMPLE  = f"B3LYP D4 RIJCOSX {ORCA_BASIS} def2/J TightSCF TightOpt FREQ"
+ORCA_SIMPLE      = f"B3LYP D4 RIJCOSX {ORCA_BASIS} def2/J TightSCF TightOpt FREQ"
+# Looser optimization — used as a fallback for molecules that fail with TightOpt
+ORCA_SIMPLE_OPT  = f"B3LYP D4 RIJCOSX {ORCA_BASIS} def2/J TightSCF Opt FREQ"
 
 # %maxcore: memory per MPI process (MB).
-# CPU nodes have 128 GB physical RAM (confirmed via SLURM FreeMem).
-# 32 cores × 3500 MB = 112 GB → 16 GB headroom for OS and file buffers.
+# CPU nodes (icme-cpu-11-*) have 32 GB RAM (32000 MB per SLURM).
+# 32 cores × 800 MB = 25.6 GB → ~6 GB headroom for OS and file buffers.
 # For multi-node jobs each node still runs 32 processes, so per-node usage is the same.
-ORCA_MAXCORE = 3500
+ORCA_MAXCORE = 800
 FREQ_LB     = 5.0    # cm⁻¹  — discard near-zero numerical noise
 FREQ_UB     = 4000.0 # cm⁻¹  — covers all physical molecular vibrations
 
@@ -242,6 +244,7 @@ def compute_and_save_modes_orca(
     nprocs: int = 32,
     freq_lb: float = FREQ_LB,
     freq_ub: float = FREQ_UB,
+    orca_keywords: str = ORCA_SIMPLE,
 ):
     os.makedirs(scratch_dir, exist_ok=True)
 
@@ -249,7 +252,7 @@ def compute_and_save_modes_orca(
         profile=OrcaProfile(command=orca_path),
         directory=scratch_dir,
         label="orca",
-        orcasimpleinput=ORCA_SIMPLE,
+        orcasimpleinput=orca_keywords,
         orcablocks=f"%pal nprocs {nprocs} end\n%maxcore {ORCA_MAXCORE}\n%scf MaxIter 300 end",
         charge=atoms.info["charge"],
         mult=atoms.info["spin"],

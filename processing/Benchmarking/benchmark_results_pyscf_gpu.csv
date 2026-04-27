@@ -1,0 +1,2 @@
+mol_idx,label,target_atoms,actual_atoms,formula,sample_idx,gpu_available,n_cpus,opt_min,scf_min,hessian_min,total_min,status
+0,C2H8N4P,15,15,C2H8N4P,22891,True,8,73.47,1.423,6.253,81.145,ok

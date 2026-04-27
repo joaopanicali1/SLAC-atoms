@@ -12,5 +12,5 @@
 #
 # NOTE: scratch directory must be on a shared filesystem, not /dev/shm.
 
-ORCA_BIN="/home/cme290/joaop/SLAC-atoms/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg/orca"
+ORCA_BIN="/home/research/joaop/SLAC-atoms/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg/orca"
 exec srun --mpi=pmi2 "$ORCA_BIN" "$@"

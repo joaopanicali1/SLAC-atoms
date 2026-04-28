@@ -1,2 +1,5 @@
-mol_idx,label,target_atoms,actual_atoms,formula,sample_idx,gpu_available,n_cpus,opt_min,scf_min,hessian_min,total_min,status
-0,C2H8N4P,15,15,C2H8N4P,22891,True,8,73.47,1.423,6.253,81.145,ok
+mol_idx,label,target_atoms,actual_atoms,formula,sample_idx,dispersion,gpu_available,n_cpus,opt_min,scf_min,hessian_min,total_min,status
+0,C2H8N4P,15,15,C2H8N4P,22891,d3bj,True,8,4.42,0.063,0.916,5.4,ok
+1,C6H17NO,25,25,C6H17NO,20164,d3bj,True,8,11.436,0.128,2.231,13.795,ok
+2,PtC11H18N3O6P,40,40,PtC11H18N3O6P,2408,d3bj,True,8,163.066,3.34,75.288,241.693,ok
+3,Br2C15H32IN2O3,55,55,Br2C15H32IN2O3,15628,d3bj,True,8,269.388,3.342,70.882,343.613,ok

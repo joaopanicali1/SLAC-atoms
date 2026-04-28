@@ -16,7 +16,9 @@ Outputs (same directory as npz, or --outdir)
   mol_XXXXXX_PD_static.csv  : R [Å], PD [e²]
   mol_XXXXXX_PD_diff.csv    : R [Å], delta_PD_pct [%], t_peak_fs [fs]
   mol_XXXXXX_SDS.csv        : q [Å⁻¹], S0 [e²]
-  mol_XXXXXX_analysis.png   : 3-panel figure
+  mol_XXXXXX_dS.csv         : q [Å⁻¹], dS [e²]   (S0(t_peak) − S0(0))
+  mol_XXXXXX_dPDF.csv       : R [Å], delta_PDF   (sine FT of ΔsM(q))
+  mol_XXXXXX_analysis.png   : 6-panel figure
 """
 import argparse
 import os
@@ -216,11 +218,25 @@ def generate_dynamic_trajectory(R0_flat, masses_amu, V_vib, omegas_ASE,
     return time_grid_fs, xyz_traj
 
 
-def compute_S0(q_arr, names, xyz):
+def compute_S0(q_arr, names, xyz,
+               q_min=None, q_max=None,
+               wavelength=None, two_theta_max_deg=None,
+               window=None):
     """
     Isotropic Debye X-ray scattering S₀(q).
     S₀(q) = Σ_i f_i(q)² + 2 Σ_{i<j} f_i(q) f_j(q) j₀(q R_ij)
     xyz: (N, 3), q_arr: (nq,)  [Å⁻¹]
+
+    Resolution constraints (all optional):
+      q_min, q_max          : clip output to this q window [Å⁻¹]
+      wavelength            : X-ray wavelength λ [Å]
+      two_theta_max_deg     : detector half-angle 2θ_max [deg]
+                              (if both wavelength and two_theta_max_deg given,
+                               q_max = (4π/λ) sin(θ_max) overrides the kwarg)
+      window                : None or 'hanning' — smooth taper near q_max to
+                              suppress truncation ripples in the sine FT
+
+    Returns (q_kept, S0_kept).
     """
     N  = len(names)
     f  = np.column_stack([_cm_form_factor(q_arr, s) for s in names])  # (nq, N)
@@ -232,7 +248,100 @@ def compute_S0(q_arr, names, xyz):
     j0  = np.where(qR > 1e-10, np.sin(qR) / qR, 1.0)
     S0 += 2 * np.sum(f[:, ii] * f[:, jj] * j0, axis=1)
 
-    return S0
+    # ── Resolution-driven q-cutoff: q_max = (4π/λ) sin(θ_max) ────────────────
+    if wavelength is not None and two_theta_max_deg is not None:
+        theta_max = np.deg2rad(two_theta_max_deg) / 2.0
+        q_max = (4 * np.pi / wavelength) * np.sin(theta_max)
+
+    # ── Window selection ────────────────────────────────────────────────────
+    lo = q_min if q_min is not None else q_arr.min()
+    hi = q_max if q_max is not None else q_arr.max()
+    keep = (q_arr >= lo) & (q_arr <= hi)
+    q_out  = q_arr[keep]
+    S0_out = S0[keep]
+
+    # ── Optional smooth taper near q_max (Hanning half-window on upper end) ──
+    if window == "hanning" and len(q_out) > 1:
+        # half-Hanning: 1 at q_min, 0 at q_max
+        u = (q_out - q_out.min()) / (q_out.max() - q_out.min())
+        taper = 0.5 * (1 + np.cos(np.pi * u))   # cos² lobe, =1 at lo, =0 at hi
+        S0_out = S0_out * taper
+
+    return q_out, S0_out
+
+
+def compute_difference_signal(S0_excited, S0_ground, fraction_excited=1.0):
+    """
+    Differential X-ray scattering signal.
+
+      ΔS(q) = (1 / γ) · [S₀(q, excited-mix) − S₀(q, ground)]
+
+    Both inputs must be on the same q-grid. fraction_excited (γ) rescales for the
+    fact that only a fraction of molecules in the beam are pumped; pass γ=1 if
+    your S0_excited is already a pure-excited-state signal (the default for our
+    classical-trajectory snapshot).
+
+    Returns ΔS on the same q-grid.
+    """
+    if S0_excited.shape != S0_ground.shape:
+        raise ValueError("S0_excited and S0_ground must have the same shape.")
+    if fraction_excited <= 0:
+        raise ValueError("fraction_excited must be > 0.")
+    return (S0_excited - S0_ground) / fraction_excited
+
+
+def compute_differential_PDF(q_arr, delta_S, names,
+                             r_grid=None, window="hanning"):
+    """
+    Differential pair distribution function ΔP(r) by sine Fourier transform.
+
+      ΔsM(q) = q · ΔS(q) / Σ_i f_i(q)²
+      ΔP(r) = (2/π) ∫₀^{q_max} ΔsM(q) sin(q r) dq
+
+    Steps:
+      1. Build the modified differential signal ΔsM(q) — multiply by q,
+         normalize by the atomic self-term to flatten the f(q)-decay envelope.
+      2. Optionally taper near q_max (Hanning) to reduce truncation ripples.
+      3. Numerically integrate the sine FT on a user-supplied r-grid.
+
+    Inputs
+      q_arr   : (nq,) [Å⁻¹], assumed sorted ascending
+      delta_S : (nq,) — ΔS(q), same grid as q_arr
+      names   : list of atom symbols (for the self-term denominator)
+      r_grid  : (nR,) [Å]; if None, uses 0..2π/Δq with reasonable spacing
+      window  : None or 'hanning' (applied to ΔsM(q) before the FT)
+
+    Returns (r_grid, delta_PDF).
+    """
+    q_arr   = np.asarray(q_arr, dtype=float)
+    delta_S = np.asarray(delta_S, dtype=float)
+    if q_arr.shape != delta_S.shape:
+        raise ValueError("q_arr and delta_S must have the same shape.")
+
+    # Self-term denominator Σ_i f_i(q)² on the input q-grid
+    f = np.column_stack([_cm_form_factor(q_arr, s) for s in names])    # (nq, N)
+    self_term = np.sum(f ** 2, axis=1)                                  # (nq,)
+
+    # ΔsM(q) = q · ΔS(q) / Σ f_i²(q)  — guard against q=0
+    sM = np.where(self_term > 0, q_arr * delta_S / self_term, 0.0)
+
+    if window == "hanning" and len(q_arr) > 1:
+        u = (q_arr - q_arr.min()) / (q_arr.max() - q_arr.min())
+        sM = sM * 0.5 * (1 + np.cos(np.pi * u))     # half-Hanning, 1→0
+
+    # Default r-grid spans up to a Nyquist-like bound
+    if r_grid is None:
+        dq    = np.mean(np.diff(q_arr))
+        r_max = np.pi / dq                          # Nyquist: r_max = π/Δq
+        r_grid = np.linspace(0.01, min(r_max, 15.0), 600)
+
+    # Sine FT by trapezoid: ΔP(r) = (2/π) ∫ ΔsM(q) sin(q r) dq
+    # Integrand shape: (nR, nq)
+    integrand = sM[None, :] * np.sin(np.outer(r_grid, q_arr))
+    delta_PDF = (2.0 / np.pi) * np.trapezoid(integrand, q_arr, axis=1)
+
+    return r_grid, delta_PDF
+
 
 
 def parse_sample_idx(path):
@@ -276,8 +385,13 @@ def main():
     parser.add_argument("npz_path",                                    help="Path to mol_XXXXXX_physics.npz")
     parser.add_argument("--T",                    type=float, default=300,  help="Temperature in K (default 300)")
     parser.add_argument("--points-per-fast-cycle",type=int,   default=10,   help="Frames per fastest-mode period (default 10)")
-    parser.add_argument("--dR",                   type=float, default=0.05, help="PD bin width Å (default 0.05)")
-    parser.add_argument("--q-max",                type=float, default=10.0, help="Max q Å⁻¹ (default 10)")
+    parser.add_argument("--dR",                   type=float, default=0.005, help="PD bin width Å (default 0.05)")
+    parser.add_argument("--q-max",                type=float, default=100, help="Max q Å⁻¹ (default 10)")
+    parser.add_argument("--q-min",                type=float, default=0.0001, help="Min q Å⁻¹ (default 0.01)")
+    parser.add_argument("--wavelength",           type=float, default=None, help="X-ray wavelength λ [Å]; if set with --two-theta-max overrides --q-max")
+    parser.add_argument("--two-theta-max",        type=float, default=None, help="Detector half-angle 2θ_max [deg]; with --wavelength sets q_max = (4π/λ) sin(θ_max)")
+    parser.add_argument("--window",               default="hanning", choices=["none", "hanning"], help="Taper near q_max for ΔS / ΔPDF (default hanning)")
+    parser.add_argument("--gamma",                type=float, default=1.0,  help="Excited-state fraction γ for ΔS rescaling (default 1.0)")
     parser.add_argument("--outdir",               default=None,             help="Output directory")
     args = parser.parse_args()
 
@@ -334,10 +448,71 @@ def main():
 
     print(f"  Peak displacement frame: {peak_frame}/{num_frames}  (t = {t_peak_fs:.2f} fs)")
 
-    # ── S₀(q) ────────────────────────────────────────────────────────────────
+    # ── S₀(q) — ground state and peak-frame structure ───────────────────────
+    # The q-window (q_min, q_max, or λ + 2θ_max) constrains S0 to the q-range
+    # the experiment can actually measure. The Hanning taper is NOT applied
+    # here — it's a Fourier-transform implementation detail and belongs in
+    # compute_differential_PDF, where it suppresses truncation ripples. The
+    # raw S0(q) we save and plot is what an experimentalist would measure.
     print("Computing S₀(q)...")
-    q_arr = np.linspace(0.01, args.q_max, 300)
-    S0    = compute_S0(q_arr, names, xyz0)
+    q_dense = np.linspace(args.q_min, args.q_max, 600)
+    win     = None if args.window == "none" else args.window
+
+    q_arr, S0_ground = compute_S0(
+        q_dense, names, xyz0,
+        q_min=args.q_min, q_max=args.q_max,
+        wavelength=args.wavelength, two_theta_max_deg=args.two_theta_max,
+        window=None,
+    )
+
+    # Same q-window for the peak-frame structure so subtraction lines up
+    xyz_peak = xyz_traj[peak_frame]
+    _, S0_peak = compute_S0(
+        q_dense, names, xyz_peak,
+        q_min=args.q_min, q_max=args.q_max,
+        wavelength=args.wavelength, two_theta_max_deg=args.two_theta_max,
+        window=None,
+    )
+
+    if args.wavelength is not None and args.two_theta_max is not None:
+        q_max_eff = q_arr.max()
+        print(f"  λ = {args.wavelength} Å, 2θ_max = {args.two_theta_max}°  →  q_max = {q_max_eff:.3f} Å⁻¹")
+    print(f"  q-range used: [{q_arr.min():.3f}, {q_arr.max():.3f}] Å⁻¹  ({len(q_arr)} points)")
+
+    # ── ΔS(q), ΔPDF(R) peak frame, and ΔPDF(R, τ) over all frames ────────
+    print("Computing ΔS(q) and ΔPDF(R)...")
+    delta_S = compute_difference_signal(S0_peak, S0_ground, fraction_excited=args.gamma)
+
+    _, delta_PDF = compute_differential_PDF(
+        q_arr, delta_S, names, r_grid=R, window=win,
+    )
+
+    # ΔPDF(R, τ) for every trajectory frame using traj_Rab already computed.
+    # Batched over frames to keep peak memory bounded (~200 MB per batch).
+    print("Computing ΔPDF(R, τ) over trajectory...")
+    f_q     = np.column_stack([_cm_form_factor(q_arr, s) for s in names])  # (nq, N)
+    st_q    = np.sum(f_q ** 2, axis=1)                                      # (nq,)
+    fp_q    = f_q[:, ii] * f_q[:, jj]                                      # (nq, nPair)
+
+    batch   = max(1, int(200e6 / (len(q_arr) * len(ii) * 8)))  # frames per batch
+    S0_all  = np.empty((len(q_arr), num_frames))
+    for b0 in range(0, num_frames, batch):
+        b1    = min(b0 + batch, num_frames)
+        qR_b  = q_arr[:, None, None] * traj_Rab[b0:b1].T[None, :, :]  # (nq, nPair, bs)
+        j0_b  = np.where(np.abs(qR_b) > 1e-10, np.sin(qR_b) / qR_b, 1.0)
+        S0_all[:, b0:b1] = st_q[:, None] + 2 * np.einsum("qp,qpt->qt", fp_q, j0_b)
+
+    dS_all  = (S0_all - S0_ground[:, None]) / args.gamma          # (nq, num_frames)
+    sM_all  = np.where(st_q[:, None] > 0,
+                       q_arr[:, None] * dS_all / st_q[:, None], 0.0)
+    if win == "hanning":
+        u       = (q_arr - q_arr.min()) / (q_arr.max() - q_arr.min())
+        sM_all *= (0.5 * (1 + np.cos(np.pi * u)))[:, None]
+
+    dq          = np.diff(q_arr).mean()
+    trap_w      = np.ones(len(q_arr)); trap_w[0] = trap_w[-1] = 0.5
+    sin_mat     = np.sin(np.outer(R, q_arr))                      # (nR, nq)
+    rPDF_traj   = (2 / np.pi) * dq * (sin_mat @ (sM_all * trap_w[:, None]))
 
     # ── Save CSVs ─────────────────────────────────────────────────────────────
     outdir = args.outdir or os.path.join(PROJECT_ROOT, "PD_data")
@@ -348,29 +523,36 @@ def main():
         "static": os.path.join(outdir, f"{stem}_PD_static.csv"),
         "diff":   os.path.join(outdir, f"{stem}_PD_diff.csv"),
         "sds":    os.path.join(outdir, f"{stem}_SDS.csv"),
+        "dPDF":   os.path.join(outdir, f"{stem}_dPDF.csv"),
         "fig":    os.path.join(outdir, f"{stem}_analysis.png"),
     }
 
     pd.DataFrame({"R_Ang": R, "PD": PD_static_1d}).to_csv(paths["static"], index=False)
     pd.DataFrame({"R_Ang": R, "delta_PD_pct": delta_PD_pct,
                   "t_peak_fs": t_peak_fs}).to_csv(paths["diff"], index=False)
-    pd.DataFrame({"q_inv_Ang": q_arr, "S0": S0}).to_csv(paths["sds"], index=False)
+    pd.DataFrame({"q_inv_Ang": q_arr, "S0_ground": S0_ground,
+                  "S0_peak": S0_peak}).to_csv(paths["sds"], index=False)
+    pd.DataFrame({"R_Ang": R, "delta_PDF": delta_PDF,
+                  "t_peak_fs": t_peak_fs}).to_csv(paths["dPDF"], index=False)
 
     for label, p in paths.items():
         if label != "fig":
             print(f"Saved: {p}")
 
-    # ── Plot ──────────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
+    # ── Plot (2 rows × 3 cols) ───────────────────────────────────────────────
+    # Col 0: static/ground     Col 1: peak-frame 1D     Col 2: time evolution 2D
+    fig, axes = plt.subplots(2, 3, figsize=(18, 9))
 
-    ax = axes[0]
+    # (0,0) Static PD(R)
+    ax = axes[0, 0]
     ax.plot(R, PD_static_1d, "k-", lw=1.5)
     ax.set_xlabel("R (Å)")
     ax.set_ylabel("Weighted pair density (e²)")
     ax.set_title("Static PD(R)")
     ax.set_xlim(0, R.max())
 
-    ax = axes[1]
+    # (0,1) ΔPD peak frame
+    ax = axes[0, 1]
     ax.axhline(0, color="gray", lw=0.8, ls="--")
     ax.plot(R, delta_PD_pct, color="steelblue", lw=1.5,
             label=f"t = {t_peak_fs:.1f} fs  (T = {args.T} K)")
@@ -380,30 +562,56 @@ def main():
     ax.set_xlim(0, R.max())
     ax.legend(fontsize=8)
 
-    ax = axes[2]
-    ax.plot(q_arr, S0, color="firebrick", lw=1.5)
-    ax.set_xlabel("q (Å⁻¹)")
-    ax.set_ylabel("S₀(q) (e²)")
-    ax.set_title("Isotropic X-ray scattering S₀(q)")
-    ax.set_xlim(0, args.q_max)
-
-    # Panel 4: 2D heatmap ΔPD(R, τ) — one period of the slowest mode
-    ax = axes[3]
-    delta_pct_2d = delta_PD_all / peak * 100          # (nR, num_frames)
-    vmax = np.percentile(np.abs(delta_pct_2d), 99)    # robust color scale
+    # (0,2) ΔPD(R, τ) heatmap
+    ax = axes[0, 2]
+    delta_pct_2d = delta_PD_all / peak * 100
+    vmax_pd = np.percentile(np.abs(delta_pct_2d), 99)
     im = ax.imshow(
-        delta_pct_2d,
-        aspect="auto",
-        origin="lower",
+        delta_pct_2d, aspect="auto", origin="lower",
         extent=[time_grid_fs[0], time_grid_fs[-1], R[0], R[-1]],
-        cmap="RdBu_r",
-        vmin=-vmax, vmax=vmax,
+        cmap="RdBu_r", vmin=-vmax_pd, vmax=vmax_pd,
     )
     ax.axvline(t_peak_fs, color="k", lw=0.8, ls="--", alpha=0.6)
     ax.set_xlabel("τ (fs)")
     ax.set_ylabel("R (Å)")
     ax.set_title("ΔPD(R, τ)  (%)")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="ΔI (%)")
+
+    # (1,0) S₀(q) ground vs peak
+    ax = axes[1, 0]
+    ax.plot(q_arr, S0_ground, color="firebrick", lw=1.5, label="ground (t=0)")
+    ax.plot(q_arr, S0_peak,   color="navy",      lw=1.0, ls="--",
+            label=f"peak (t={t_peak_fs:.1f} fs)")
+    ax.set_xlabel("q (Å⁻¹)")
+    ax.set_ylabel("S₀(q) (e²)")
+    ax.set_title("Isotropic scattering S₀(q)")
+    ax.set_xlim(q_arr.min(), q_arr.max())
+    ax.legend(fontsize=8)
+
+    # (1,1) R·ΔPDF(R) peak frame — beneath ΔPD for direct comparison
+    ax = axes[1, 1]
+    ax.axhline(0, color="gray", lw=0.8, ls="--")
+    ax.plot(R, delta_PDF, color="purple", lw=1.5,
+            label=f"t = {t_peak_fs:.1f} fs")
+    ax.set_xlabel("R (Å)")
+    ax.set_ylabel("ΔPDF (a.u.)")
+    ax.set_title("ΔPDF  (peak frame, from scattering)")
+    ax.set_xlim(0, R.max())
+    ax.legend(fontsize=8)
+
+    # (1,2) R·ΔPDF(R, τ) heatmap — beneath ΔPD(R, τ)
+    ax = axes[1, 2]
+    vmax_pdf = np.percentile(np.abs(rPDF_traj), 99)
+    im2 = ax.imshow(
+        rPDF_traj, aspect="auto", origin="lower",
+        extent=[time_grid_fs[0], time_grid_fs[-1], R[0], R[-1]],
+        cmap="RdBu_r", vmin=-vmax_pdf, vmax=vmax_pdf,
+    )
+    ax.axvline(t_peak_fs, color="k", lw=0.8, ls="--", alpha=0.6)
+    ax.set_xlabel("τ (fs)")
+    ax.set_ylabel("R (Å)")
+    ax.set_title("ΔPDF(R, τ)  (from scattering)")
+    fig.colorbar(im2, ax=ax, fraction=0.046, pad=0.04, label="ΔPDF")
 
     fig.suptitle(f"mol_{sample_idx:06d}  —  {formula}", fontsize=12)
     fig.tight_layout()

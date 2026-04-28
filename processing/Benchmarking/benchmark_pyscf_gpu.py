@@ -30,7 +30,8 @@ except ImportError:
     GPU_AVAILABLE = False
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from modes_lib import FUNCTIONAL, DISPERSION, BASIS
+from modes_lib import FUNCTIONAL, BASIS
+DISPERSION = "d3bj"   # D3BJ has analytical Hessian in gpu4pyscf; D4 does not
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DB_PATH      = os.path.join(PROJECT_ROOT, "train_4M", "data0000.aselmdb")
@@ -50,8 +51,9 @@ ALL_MOLECULES = [
 
 
 def _build_mf(mol_obj, pyscf_spin: int):
-    """Build RKS or UKS mean-field object. dft is gpu4pyscf.dft or pyscf.dft depending on import."""
+    """Build RKS or UKS mean-field object with density fitting for faster Coulomb integrals."""
     mf = dft.UKS(mol_obj) if pyscf_spin > 0 else dft.RKS(mol_obj)
+    mf = mf.density_fit()   # RI-J approximation — speeds up SCF/grad steps like ORCA's RIJCOSX
     mf.xc       = FUNCTIONAL
     mf.disp     = DISPERSION
     mf.max_cycle = 300
@@ -70,7 +72,7 @@ def run_benchmark(atoms, n_cpus: int):
 
     lib.num_threads(n_cpus)
 
-    mol = gto.M(atom=atom_str, basis=BASIS, charge=charge, spin=pyscf_spin, verbose=3)
+    mol = gto.M(atom=atom_str, basis=BASIS, ecp=BASIS, charge=charge, spin=pyscf_spin, verbose=3)
 
     # --- geometry optimization ---
     t0 = time.perf_counter()
@@ -83,7 +85,7 @@ def run_benchmark(atoms, n_cpus: int):
     mf.kernel()
     t_scf = time.perf_counter() - t1
 
-    # --- analytical Hessian ---
+    # --- Hessian (analytical with D3BJ, would be finite-difference with D4) ---
     t2 = time.perf_counter()
     h = mf.Hessian().kernel()
     t_hess = time.perf_counter() - t2
@@ -137,7 +139,7 @@ def main():
 
     write_header = not os.path.exists(OUT_CSV)
     fields = ["mol_idx", "label", "target_atoms", "actual_atoms", "formula",
-              "sample_idx", "gpu_available", "n_cpus",
+              "sample_idx", "dispersion", "gpu_available", "n_cpus",
               "opt_min", "scf_min", "hessian_min", "total_min", "status"]
     with open(OUT_CSV, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -150,6 +152,7 @@ def main():
             actual_atoms=len(atoms),
             formula=row.formula,
             sample_idx=sample_idx,
+            dispersion=DISPERSION,
             gpu_available=GPU_AVAILABLE,
             n_cpus=args.cpus,
             opt_min=round(timings["t_opt"] / 60, 3),

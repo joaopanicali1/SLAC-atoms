@@ -1,23 +1,21 @@
 #!/usr/bin/env python
 """
-analyse_mol.py — static PD(R), ΔPD(R), and S₀(q) from a mol_data .npz file.
+analyse_mol.py — static PD(R), ΔPD(R), S₀(q), and ΔPDF(R) from a mol_data .npz file.
 
-ΔPD(R) = PD(R, t_peak) − PD(R, 0) following the paper definition (Natan 2023):
-the difference between the pair density at peak structural displacement and the
-equilibrium (τ=0) pair density. The trajectory is generated with classical harmonic
-oscillation (ported from trajectory_pipeline_cluster.ipynb).
+ΔPD(R) = PD(R, t_end) − PD(R, 0): pair density at the end of the classical harmonic
+trajectory minus the DFT equilibrium geometry (R_0). The trajectory spans one full
+period of the slowest normal mode (ported from trajectory_pipeline_cluster.ipynb).
 
 Usage
 -----
   python processing/analyse_mol.py mol_data/mol_000080_physics.npz
   python processing/analyse_mol.py mol_data/mol_000080_physics.npz --T 300 --dR 0.02
 
-Outputs (same directory as npz, or --outdir)
-  mol_XXXXXX_PD_static.csv  : R [Å], PD [e²]
-  mol_XXXXXX_PD_diff.csv    : R [Å], delta_PD_pct [%], t_peak_fs [fs]
-  mol_XXXXXX_SDS.csv        : q [Å⁻¹], S0 [e²]
-  mol_XXXXXX_dS.csv         : q [Å⁻¹], dS [e²]   (S0(t_peak) − S0(0))
-  mol_XXXXXX_dPDF.csv       : R [Å], delta_PDF   (sine FT of ΔsM(q))
+Outputs (in PD_data/, or --outdir)
+  mol_XXXXXX_PD_static.csv  : R [Å], PD [e²]             — equilibrium pair density
+  mol_XXXXXX_PD_diff.csv    : R [Å], delta_PD_pct [%]    — ΔPD at end of trajectory
+  mol_XXXXXX_SDS.csv        : q [Å⁻¹], S0_ground, S0_mean — scattering ground + traj mean
+  mol_XXXXXX_dPDF.csv       : R [Å], delta_PDF            — ΔPDF at end of trajectory
   mol_XXXXXX_analysis.png   : 6-panel figure
 """
 import argparse
@@ -386,8 +384,8 @@ def main():
     parser.add_argument("--T",                    type=float, default=300,  help="Temperature in K (default 300)")
     parser.add_argument("--points-per-fast-cycle",type=int,   default=10,   help="Frames per fastest-mode period (default 10)")
     parser.add_argument("--dR",                   type=float, default=0.005, help="PD bin width Å (default 0.05)")
-    parser.add_argument("--q-max",                type=float, default=100, help="Max q Å⁻¹ (default 10)")
-    parser.add_argument("--q-min",                type=float, default=0.0001, help="Min q Å⁻¹ (default 0.01)")
+    parser.add_argument("--q-max",                type=float, default=15, help="Max q Å⁻¹ (default 10)")
+    parser.add_argument("--q-min",                type=float, default=0, help="Min q Å⁻¹ (default 0.01)")
     parser.add_argument("--wavelength",           type=float, default=None, help="X-ray wavelength λ [Å]; if set with --two-theta-max overrides --q-max")
     parser.add_argument("--two-theta-max",        type=float, default=None, help="Detector half-angle 2θ_max [deg]; with --wavelength sets q_max = (4π/λ) sin(θ_max)")
     parser.add_argument("--window",               default="hanning", choices=["none", "hanning"], help="Taper near q_max for ΔS / ΔPDF (default hanning)")
@@ -413,7 +411,7 @@ def main():
     print(f"T={args.T} K  dR={args.dR} Å")
 
     # ── Classical harmonic trajectory ─────────────────────────────────────────
-    # ΔPD(R,τ) = PD(R,τ) − PD(R,0)  [paper eq., Natan 2023]
+    # ΔPD(R,τ) = PD(R,τ) − PD(R,0) 
     # PD(R,0) = static equilibrium; PD(R,τ) = trajectory snapshot at τ
     print("Generating classical harmonic trajectory...")
     time_grid_fs, xyz_traj = generate_dynamic_trajectory(
@@ -434,26 +432,18 @@ def main():
     R, PD_static, _ = compute_PD(xyz0, names, dR=args.dR, R_edges=R_edges)
     PD_static_1d    = PD_static[:, 0]
 
-    # Compute PD for every trajectory frame; find peak displacement frame
+    # Compute PD for every trajectory frame
     xyz_traj_transposed = xyz_traj.transpose(1, 2, 0)  # (N, 3, num_frames)
     _, PD_traj, _ = compute_PD(xyz_traj_transposed, names, dR=args.dR, R_edges=R_edges)
 
-    # Peak frame = frame with largest total absolute ΔPD (max departure from equilibrium)
-    delta_PD_all = PD_traj - PD_static_1d[:, None]    # (nR, num_frames)
-    peak_frame   = int(np.argmax(np.sum(np.abs(delta_PD_all), axis=0)))
-    t_peak_fs    = time_grid_fs[peak_frame]
+    delta_PD_all = PD_traj - PD_static_1d[:, None]            # (nR, num_frames)
+    PD_max         = PD_static_1d.max()
+    delta_PD_pct = delta_PD_all[:, -1] / PD_max * 100           # ΔPD (%) at end of trajectory
 
-    peak         = PD_static_1d.max()
-    delta_PD_pct = delta_PD_all[:, peak_frame] / peak * 100  # ΔPD (%)
-
-    print(f"  Peak displacement frame: {peak_frame}/{num_frames}  (t = {t_peak_fs:.2f} fs)")
-
-    # ── S₀(q) — ground state and peak-frame structure ───────────────────────
-    # The q-window (q_min, q_max, or λ + 2θ_max) constrains S0 to the q-range
-    # the experiment can actually measure. The Hanning taper is NOT applied
-    # here — it's a Fourier-transform implementation detail and belongs in
-    # compute_differential_PDF, where it suppresses truncation ripples. The
-    # raw S0(q) we save and plot is what an experimentalist would measure.
+    # ── S₀(q) — ground state ────────────────────────────────────────────────
+    # q-window constrains S0 to the measurable range. Hanning taper is NOT
+    # applied here — it belongs in the sine FT step to suppress truncation
+    # ripples. The raw S0(q) saved here is what an experimentalist would measure.
     print("Computing S₀(q)...")
     q_dense = np.linspace(args.q_min, args.q_max, 600)
     win     = None if args.window == "none" else args.window
@@ -465,31 +455,12 @@ def main():
         window=None,
     )
 
-    # Same q-window for the peak-frame structure so subtraction lines up
-    xyz_peak = xyz_traj[peak_frame]
-    _, S0_peak = compute_S0(
-        q_dense, names, xyz_peak,
-        q_min=args.q_min, q_max=args.q_max,
-        wavelength=args.wavelength, two_theta_max_deg=args.two_theta_max,
-        window=None,
-    )
-
     if args.wavelength is not None and args.two_theta_max is not None:
-        q_max_eff = q_arr.max()
-        print(f"  λ = {args.wavelength} Å, 2θ_max = {args.two_theta_max}°  →  q_max = {q_max_eff:.3f} Å⁻¹")
+        print(f"  λ = {args.wavelength} Å, 2θ_max = {args.two_theta_max}°  →  q_max = {q_arr.max():.3f} Å⁻¹")
     print(f"  q-range used: [{q_arr.min():.3f}, {q_arr.max():.3f}] Å⁻¹  ({len(q_arr)} points)")
 
-    # ── ΔS(q), ΔPDF(R) peak frame, and ΔPDF(R, τ) over all frames ────────
-    print("Computing ΔS(q) and ΔPDF(R)...")
-    delta_S = compute_difference_signal(S0_peak, S0_ground, fraction_excited=args.gamma)
-
-    _, delta_PDF = compute_differential_PDF(
-        q_arr, delta_S, names, r_grid=R, window=win,
-    )
-
-    # ΔPDF(R, τ) for every trajectory frame using traj_Rab already computed.
-    # Batched over frames to keep peak memory bounded (~200 MB per batch).
-    print("Computing ΔPDF(R, τ) over trajectory...")
+    # ── S₀(q, τ), ΔS(q, τ), ΔPDF(R) — computed across full trajectory ──────
+    print("Computing ΔPDF(R) and ΔPDF(R, τ) over trajectory...")
     f_q     = np.column_stack([_cm_form_factor(q_arr, s) for s in names])  # (nq, N)
     st_q    = np.sum(f_q ** 2, axis=1)                                      # (nq,)
     fp_q    = f_q[:, ii] * f_q[:, jj]                                      # (nq, nPair)
@@ -503,16 +474,23 @@ def main():
         S0_all[:, b0:b1] = st_q[:, None] + 2 * np.einsum("qp,qpt->qt", fp_q, j0_b)
 
     dS_all  = (S0_all - S0_ground[:, None]) / args.gamma          # (nq, num_frames)
+    S0_mean = S0_all.mean(axis=1)                                  # (nq,) time-averaged
+
     sM_all  = np.where(st_q[:, None] > 0,
                        q_arr[:, None] * dS_all / st_q[:, None], 0.0)
     if win == "hanning":
         u       = (q_arr - q_arr.min()) / (q_arr.max() - q_arr.min())
         sM_all *= (0.5 * (1 + np.cos(np.pi * u)))[:, None]
 
-    dq          = np.diff(q_arr).mean()
-    trap_w      = np.ones(len(q_arr)); trap_w[0] = trap_w[-1] = 0.5
-    sin_mat     = np.sin(np.outer(R, q_arr))                      # (nR, nq)
-    rPDF_traj   = (2 / np.pi) * dq * (sin_mat @ (sM_all * trap_w[:, None]))
+    dq      = np.diff(q_arr).mean()
+    trap_w  = np.ones(len(q_arr)); trap_w[0] = trap_w[-1] = 0.5
+    sin_mat = np.sin(np.outer(R, q_arr))                          # (nR, nq)
+
+    # ΔPDF at end of trajectory
+    delta_PDF = (2 / np.pi) * dq * (sin_mat @ (sM_all[:, -1] * trap_w))
+
+    # Full ΔPDF(R, τ) heatmap
+    rPDF_traj = (2 / np.pi) * dq * (sin_mat @ (sM_all * trap_w[:, None]))
 
     # ── Save CSVs ─────────────────────────────────────────────────────────────
     outdir = args.outdir or os.path.join(PROJECT_ROOT, "PD_data")
@@ -528,19 +506,17 @@ def main():
     }
 
     pd.DataFrame({"R_Ang": R, "PD": PD_static_1d}).to_csv(paths["static"], index=False)
-    pd.DataFrame({"R_Ang": R, "delta_PD_pct": delta_PD_pct,
-                  "t_peak_fs": t_peak_fs}).to_csv(paths["diff"], index=False)
+    pd.DataFrame({"R_Ang": R, "delta_PD_pct": delta_PD_pct}).to_csv(paths["diff"], index=False)
     pd.DataFrame({"q_inv_Ang": q_arr, "S0_ground": S0_ground,
-                  "S0_peak": S0_peak}).to_csv(paths["sds"], index=False)
-    pd.DataFrame({"R_Ang": R, "delta_PDF": delta_PDF,
-                  "t_peak_fs": t_peak_fs}).to_csv(paths["dPDF"], index=False)
+                  "S0_mean": S0_mean}).to_csv(paths["sds"], index=False)
+    pd.DataFrame({"R_Ang": R, "delta_PDF": delta_PDF}).to_csv(paths["dPDF"], index=False)
 
     for label, p in paths.items():
         if label != "fig":
             print(f"Saved: {p}")
 
     # ── Plot (2 rows × 3 cols) ───────────────────────────────────────────────
-    # Col 0: static/ground     Col 1: peak-frame 1D     Col 2: time evolution 2D
+    # Col 0: static/ground     Col 1: end-of-trajectory 1D     Col 2: time evolution 2D
     fig, axes = plt.subplots(2, 3, figsize=(18, 9))
 
     # (0,0) Static PD(R)
@@ -551,55 +527,54 @@ def main():
     ax.set_title("Static PD(R)")
     ax.set_xlim(0, R.max())
 
-    # (0,1) ΔPD peak frame
+    # (0,1) ΔPD at end of trajectory vs equilibrium
     ax = axes[0, 1]
     ax.axhline(0, color="gray", lw=0.8, ls="--")
     ax.plot(R, delta_PD_pct, color="steelblue", lw=1.5,
-            label=f"t = {t_peak_fs:.1f} fs  (T = {args.T} K)")
+            label=f"T = {args.T} K  (t = T)")
     ax.set_xlabel("R (Å)")
     ax.set_ylabel("ΔI (%)")
-    ax.set_title("ΔPD  (peak frame)")
+    ax.set_title("ΔPD  (end of trajectory)")
     ax.set_xlim(0, R.max())
     ax.legend(fontsize=8)
 
     # (0,2) ΔPD(R, τ) heatmap
     ax = axes[0, 2]
-    delta_pct_2d = delta_PD_all / peak * 100
+    delta_pct_2d = delta_PD_all / PD_max * 100
     vmax_pd = np.percentile(np.abs(delta_pct_2d), 99)
     im = ax.imshow(
         delta_pct_2d, aspect="auto", origin="lower",
         extent=[time_grid_fs[0], time_grid_fs[-1], R[0], R[-1]],
         cmap="RdBu_r", vmin=-vmax_pd, vmax=vmax_pd,
     )
-    ax.axvline(t_peak_fs, color="k", lw=0.8, ls="--", alpha=0.6)
     ax.set_xlabel("τ (fs)")
     ax.set_ylabel("R (Å)")
     ax.set_title("ΔPD(R, τ)  (%)")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="ΔI (%)")
 
-    # (1,0) S₀(q) ground vs peak
+    # (1,0) S₀(q) ground vs time-averaged
     ax = axes[1, 0]
     ax.plot(q_arr, S0_ground, color="firebrick", lw=1.5, label="ground (t=0)")
-    ax.plot(q_arr, S0_peak,   color="navy",      lw=1.0, ls="--",
-            label=f"peak (t={t_peak_fs:.1f} fs)")
+    ax.plot(q_arr, S0_mean,   color="navy",      lw=1.0, ls="--",
+            label="time-averaged")
     ax.set_xlabel("q (Å⁻¹)")
     ax.set_ylabel("S₀(q) (e²)")
     ax.set_title("Isotropic scattering S₀(q)")
     ax.set_xlim(q_arr.min(), q_arr.max())
     ax.legend(fontsize=8)
 
-    # (1,1) R·ΔPDF(R) peak frame — beneath ΔPD for direct comparison
+    # (1,1) ΔPDF time-averaged — beneath ΔPD for direct comparison
     ax = axes[1, 1]
     ax.axhline(0, color="gray", lw=0.8, ls="--")
     ax.plot(R, delta_PDF, color="purple", lw=1.5,
-            label=f"t = {t_peak_fs:.1f} fs")
+            label=f"T = {args.T} K  (t = T)")
     ax.set_xlabel("R (Å)")
     ax.set_ylabel("ΔPDF (a.u.)")
-    ax.set_title("ΔPDF  (peak frame, from scattering)")
+    ax.set_title("ΔPDF  (end of trajectory, from scattering)")
     ax.set_xlim(0, R.max())
     ax.legend(fontsize=8)
 
-    # (1,2) R·ΔPDF(R, τ) heatmap — beneath ΔPD(R, τ)
+    # (1,2) ΔPDF(R, τ) heatmap — beneath ΔPD(R, τ)
     ax = axes[1, 2]
     vmax_pdf = np.percentile(np.abs(rPDF_traj), 99)
     im2 = ax.imshow(
@@ -607,7 +582,6 @@ def main():
         extent=[time_grid_fs[0], time_grid_fs[-1], R[0], R[-1]],
         cmap="RdBu_r", vmin=-vmax_pdf, vmax=vmax_pdf,
     )
-    ax.axvline(t_peak_fs, color="k", lw=0.8, ls="--", alpha=0.6)
     ax.set_xlabel("τ (fs)")
     ax.set_ylabel("R (Å)")
     ax.set_title("ΔPDF(R, τ)  (from scattering)")

@@ -17,3 +17,4 @@ SLAC-atoms.code-workspace
 requirements.txt
 processing/logs
 orca_scratch_tmp
+.idea

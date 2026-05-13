@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.io import loadmat
-from scipy.interpolate import PchipInterpolator
+from scipy.interpolate import PchipInterpolator, Akima1DInterpolator
 from scipy.special import spherical_jn
 from scipy.io import loadmat 
 import matplotlib
@@ -140,6 +140,7 @@ def DBT(n: int, data: np.ndarray, q: np.ndarray, M: int=None):
     in_range = (qgrid >= q[0]) & (qgrid <= q[-1])
     data_s = np.zeros((M-1, data.shape[1]))
     if np.any(in_range):
+        # interp = Akima1DInterpolator(q, data, axis=0)
         interp = PchipInterpolator(q, data, axis=0, extrapolate=False)
         data_s[in_range, :] = interp(qgrid[in_range])
 
@@ -151,7 +152,7 @@ def DBT(n: int, data: np.ndarray, q: np.ndarray, M: int=None):
     denom = BZ[M-1] * spherical_jn(n+1, bz_inner)**2
     arg = np.outer(bz_inner, bz_inner) / BZ[M-1]
     numer = 2 * spherical_jn(n, arg)
-    G = numer / denom[np.newaxis, :]
+    G = numer / denom[:, np.newaxis]
 
     # apply jacobian 
     data_s = data_s * qgrid[:, np.newaxis]
@@ -364,15 +365,13 @@ def run_pipeline(mat_path: str, output_path: str):
     # simulate scattering
     print("Simulating X-ray scattering...")
     S0 = np.zeros((len(q), nTime, nModes))
-    info_ref = None
 
     for nd in range(nModes):
         for nt in range(nTime):
             xyz = xyzt_mode[:, :, nt, nd]
             s, info = simulate_scattering(q, atom_name, xyz)
             S0[:, nt, nd] = s
-            if info_ref is None:
-                info_ref = info
+    info_ref = info
 
     f0 = info_ref["f0"]
     all_pairs = info_ref["all_pairs"]
@@ -496,6 +495,6 @@ def run_pipeline(mat_path: str, output_path: str):
 
 if __name__ == "__main__":
     mat_path = "processing/DemoMatlabData/h2o_xyzt_minimal.mat"
-    output_path = "processing/figures/figures.png"
+    output_path = "processing/figures/recov_pchip.png"
     fig = run_pipeline(mat_path, output_path)
     fig.show()

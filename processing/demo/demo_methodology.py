@@ -45,7 +45,7 @@ DISPERSION   = "D4"          # dispersion correction (Grimme D4)
 BASIS        = "def2-TZVPD"  # triple-zeta polarised basis with diffuse functions
 AUX_BASIS    = "def2/J"      # Weigend Coulomb-fitting auxiliary basis (RIJCOSX)
 ORCA_MAXCORE = 800           # MB of RAM per MPI process
-NPROCS       = 1             # MPI processes 
+NPROCS       = 1             # MPI processes. Not the same as prod. 
 
 # Normal-mode filtering (modes_lib.py: FREQ_LB, FREQ_UB)
 FREQ_LB = 5.0     # cm⁻¹  lower bound — discards near-zero numerical noise

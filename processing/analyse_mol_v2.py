@@ -8,6 +8,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from itertools import combinations
 from form_factors.atomic_form_factors import ATOMIC_FORM_FACTORS
+from ase import units as _ase_units
+from ase.db import connect as _ase_connect
+
+import re
+from pathlib import Path
+import os 
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(_HERE)
+DB_PATH = os.path.join(PROJECT_ROOT, "train_4M", "data0000.aselmdb")
+
+_DB = _ase_connect(DB_PATH)
+
 
 def atomic_form_factor(element: str, q: np.ndarray) -> np.ndarray:
     """
@@ -22,6 +35,59 @@ def atomic_form_factor(element: str, q: np.ndarray) -> np.ndarray:
 
     s2 = (q / (4 * np.pi)) ** 2
     return np.exp(-np.outer(s2, b)) @ a + c
+
+def build_scattering_context(
+    atom_names: list[str],
+    q: np.ndarray,
+):
+    """
+    Precompute everything that depends only on atoms and q grid. 
+    """
+    f0 = np.column_stack([
+        atomic_form_factor(el, q)
+        for el in atom_names
+    ])
+
+    all_pairs = np.array(
+        list(combinations(range(len(atom_names)), 2))
+    )
+
+    fafb = (
+        f0[:, all_pairs[:, 0]]
+        * f0[:, all_pairs[:, 1]]
+    )
+
+    fe = np.sum(fafb, axis=1)
+    self_scatter = np.sum(f0**2, axis=1)
+
+    Z = np.array([
+        ATOMIC_FORM_FACTORS[el]["Z"]
+        for el in atom_names
+    ])
+
+    pair_weights = (
+        Z[all_pairs[:, 0]]
+        * Z[all_pairs[:, 1]]
+    )
+
+    return {
+        "f0": f0,
+        "all_pairs": all_pairs,
+        "fafb": fafb,
+        "fe": fe,
+        "self_scatter": self_scatter,
+        "pair_weights": pair_weights,
+    }
+
+def get_atom_names(sample_idx):
+    """
+    Look up atom symbols from the ASE database.
+    Falls back to reading 'symbols' from the npz if sample_idx is None
+    (e.g. mol_water_physics.npz created outside the database pipeline).
+    """
+    if sample_idx is not None:
+        row = _DB.get(int(sample_idx) + 1)
+        return list(row.toatoms().get_chemical_symbols())
 
 def simulate_scattering(q: np.ndarray, atom_names: list, xyz: np.ndarray):
     """
@@ -53,6 +119,57 @@ def simulate_scattering(q: np.ndarray, atom_names: list, xyz: np.ndarray):
     info = dict(f0=f0, all_pairs=all_pairs, fafb=fafb, fe=fe, pair_labels=pair_labels)
 
     return S0, info
+
+def simulate_scattering_batch(
+    q: np.ndarray,
+    xyz_traj: np.ndarray,
+    scattering_ctx: dict,
+):
+    """
+    Vectorized Debye scattering simulation.
+
+    Parameters
+    ----------
+    xyz_traj:
+        (n_traj, n_frames, N, 3)
+
+    Returns
+    -------
+    S0:
+        (n_traj, n_frames, nq)
+    r_ab:
+        (n_traj, n_frames, n_pairs)
+    """
+
+    all_pairs = scattering_ctx["all_pairs"]
+    fafb = scattering_ctx["fafb"]
+    self_scatter = scattering_ctx["self_scatter"]
+
+    diff = (
+        xyz_traj[:, :, all_pairs[:, 1], :]
+        - xyz_traj[:, :, all_pairs[:, 0], :]
+    )
+
+    r_ab = np.linalg.norm(diff, axis=-1)
+
+    qr = (
+        q[None, None, :, None]
+        * r_ab[:, :, None, :]
+    )
+
+    bessel = np.sinc(qr / np.pi)
+
+    pair_sum = np.sum(
+        fafb[None, None, :, :] * bessel,
+        axis=-1,
+    )
+
+    S0 = (
+        self_scatter[None, None, :]
+        + 2 * pair_sum
+    )
+
+    return S0, r_ab
 
 def bessel_zeros_spherical(n: int, k: int) -> np.ndarray:
     """
@@ -335,6 +452,14 @@ def _ensure_numpy(x):
     """
     return np.array(x).squeeze()
 
+def lorch(q):
+    detector = np.ones_like(q)
+    ndet = np.sum(detector > 0)
+    lorch = np.sin(np.linspace(0, np.pi, ndet))
+    detector[detector > 0] = lorch
+    detector /= np.sum(detector)
+    return detector
+
 def run_pipeline(mat_path: str, output_path: str):
     """
     Scattering + signal recovery pipeline 
@@ -380,11 +505,7 @@ def run_pipeline(mat_path: str, output_path: str):
     pair_labels = info_ref["pair_labels"]
 
     # detector window
-    detector = np.ones_like(q)
-    ndet = np.sum(detector > 0)
-    lorch = np.sin(np.linspace(0, np.pi, ndet))
-    detector[detector > 0] = lorch
-    detector /= np.sum(detector)
+    detector = lorch(q)
 
     # background subtracted, normalized signal
     self_scattering = np.sum(f0**2, axis=1)
@@ -452,7 +573,7 @@ def run_pipeline(mat_path: str, output_path: str):
         ax.imshow(S0[:, :, nd], aspect='auto', origin='lower', cmap=cmap,
                   extent=[t_common_fs[0], t_common_fs[-1], q[0], q[-1]])
         ax.set_ylim(0, 5)
-        ax.set_title(f'$S_0$ mode #{mn}')
+        ax.set_title(f'$S_0$ mode {mn}')
         ax.set_ylabel('q (A^-1)')
         ax.set_xlabel('time (fs)')
  
@@ -462,7 +583,7 @@ def run_pipeline(mat_path: str, output_path: str):
                        extent=[t_common_fs[0], t_common_fs[-1],
                                 Rvec[0], Rvec[-1]])
         ax.set_ylim(1, 5)
-        ax.set_title(f'$PD_0$ mode #{mn}')
+        ax.set_title(f'$PD_0$ mode {mn}')
         ax.set_ylabel('R (A)')
         ax.set_xlabel('time (fs)')
         plt.colorbar(im, ax=ax)
@@ -473,7 +594,7 @@ def run_pipeline(mat_path: str, output_path: str):
                        extent=[t_common_fs[0], t_common_fs[-1],
                                 Rvec[0], Rvec[-1]])
         ax.set_ylim(1, 5)
-        ax.set_title(f'$PD_0$ mode #{mn} L1/TV')
+        ax.set_title(f'$PD_0$ mode {mn} L1/TV')
         ax.set_ylabel('R (A)')
         ax.set_xlabel('time (fs)')
         plt.colorbar(im, ax=ax)
@@ -484,7 +605,7 @@ def run_pipeline(mat_path: str, output_path: str):
             color = pair_colors[p % len(pair_colors)]
             ax.plot(t_common_fs, Rab[p, :, nd], color=color, label=lbl)
         ax.set_ylim(1, 5)
-        ax.set_title(f'Ground Truth mode #{mn}')
+        ax.set_title(f'Ground Truth mode {mn}')
         ax.set_ylabel('R (A)')
         ax.set_xlabel('time (fs)')
         ax.legend(fontsize=7)
@@ -493,8 +614,200 @@ def run_pipeline(mat_path: str, output_path: str):
     print(f"Figure saved to {output_path}")
     return fig
 
+
+# -----------------------------------------------------------------------------------
+# Computing the relevant trajectories and ground truth PD
+# -----------------------------------------------------------------------------------
+
+def generate_trajectory_batch(
+    R0_flat: np.ndarray,   # (3N,)
+    masses_amu: np.ndarray,   # (N,)
+    V_vib: np.ndarray,   # (3N, n_modes)
+    omegas_ASE: np.ndarray,   # (n_modes,)
+    T_kelvin: float = 300.0,
+    n_traj: int = 30,
+    points_per_fast_cycle: int = 10,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns
+    -------
+    time_fs  : (n_frames,)
+    xyz_traj : (n_traj, n_frames, N, 3)
+    """
+    rng = np.random.default_rng(seed)
+    N = len(R0_flat) // 3
+
+    if len(omegas_ASE) == 0:
+        raise ValueError("omegas_ASE is empty — no vibrational modes found.")
+
+    periods_fs = (2 * np.pi / omegas_ASE) / _ase_units.fs
+    t_total_fs = np.max(periods_fs)
+    dt_fs = np.min(periods_fs) / points_per_fast_cycle
+    time_fs = np.arange(0, t_total_fs + dt_fs, dt_fs)
+    num_frames = len(time_fs)
+    time_ASE = (time_fs * _ase_units.fs).reshape(-1, 1)
+
+    # placeholder bc we're confused about this 
+    A_k = np.sqrt(2 * _ase_units.kB * T_kelvin) / omegas_ASE
+    inv_sqrt_m = 1.0 / np.sqrt(masses_amu)
+
+    all_trajs = np.empty((n_traj, num_frames, N, 3), dtype=np.float32)
+    for i in range(n_traj):
+        phi = rng.uniform(0, 2 * np.pi, len(omegas_ASE))
+        c_t = A_k * np.cos(omegas_ASE * time_ASE + phi)      # (frames, n_modes)
+        dR = (V_vib * inv_sqrt_m[:, None]) @ c_t.T          # (3N, frames)
+        all_trajs[i] = (R0_flat[:, None] + dR).T.reshape(num_frames, N, 3)
+
+    return time_fs, all_trajs
+
+def compute_ground_truth_pd(xyz: np.ndarray, atom_names: list, R_grid: np.ndarray):
+    """
+    Compute weighted pair distance histogram directly from trajectory.
+    """
+    all_pairs = np.array(list(combinations(range(len(atom_names)), 2)))
+    diff = xyz[all_pairs[:, 1]] - xyz[all_pairs[:, 0]]
+    r_ab = np.sqrt(np.sum(diff ** 2, axis=1))
+
+    Z = np.array([ATOMIC_FORM_FACTORS[el]['Z'] for el in atom_names])
+    pair_weights = Z[all_pairs[:, 0]] * Z[all_pairs[:, 1]]
+
+    dR = R_grid[1] - R_grid[0]
+    pd = np.zeros(len(R_grid))
+    idx = np.floor(((r_ab - R_grid[0]) / dR)).astype(int)
+    valid_idx = (idx >= 0) & (idx < len(R_grid))
+    np.add.at(pd, idx[valid_idx], pair_weights[valid_idx])
+    
+    return pd
+
+def compute_ground_truth_pd_batch(r_ab, pair_weights, R_grid):
+    n_traj, n_frames, n_pairs = r_ab.shape
+    n_R = len(R_grid)
+
+    dR = R_grid[1] - R_grid[0]
+
+    idx = np.floor((r_ab - R_grid[0]) / dR).astype(np.int32)
+    valid = (idx >= 0) & (idx < n_R)
+
+    pd = np.zeros((n_traj, n_frames, n_R), dtype=np.float32)
+
+    flat_idx = idx[valid]
+    flat_w = np.broadcast_to(pair_weights, r_ab.shape)[valid]
+
+    traj_ids, frame_ids, _ = np.where(valid)
+
+    np.add.at(
+        pd,
+        (traj_ids, frame_ids, flat_idx),
+        flat_w
+    )
+
+    return pd
+
+def process_molecule(
+    npz_path: Path,
+    out_dir: Path,
+    dq: float = 0.1,
+    qmax: float = 10.0,
+    dR: float = 0.025,
+    T_kelvin: float = 300.0,
+    n_traj: int = 30,
+    points_per_fast_cycle: int = 10):
+
+
+    match = re.search(r'mol_(\d+)_physics', npz_path.stem)
+
+    if match is None:
+        return f"SKIP {npz_path.name}: cannot parse index"
+
+    mol_idx = int(match.group(1))
+    out_path = (out_dir/ f"mol_{mol_idx:06d}_pd.npz")
+
+    if out_path.exists():
+        return None
+
+    data = np.load(npz_path)
+
+    R0_flat = data["R_0"].ravel().astype(np.float64)
+    masses_amu = data["masses_amu"].astype(np.float64)
+    V_vib = data["V_vib"].astype(np.float64)
+    omegas_ASE = data["omegas_ASE"].astype(np.float64)
+
+    try:
+        time_fs, xyz_traj = generate_trajectory_batch(
+            R0_flat,
+            masses_amu,
+            V_vib,
+            omegas_ASE,
+            T_kelvin=T_kelvin,
+            n_traj=n_traj,
+            points_per_fast_cycle=points_per_fast_cycle,
+            seed=mol_idx,
+        )
+    except ValueError as e:
+        return f"SKIP {npz_path.name}: {e}"
+
+    atom_names = get_atom_names(mol_idx)
+
+    q = np.arange(np.finfo(float).eps, qmax + dq, dq)
+
+    detector = lorch(q)
+
+    M = int(np.ceil(np.pi / (dR * dq))) + 1
+
+    ctx = build_scattering_context(atom_names, q)
+
+    S0, r_ab = simulate_scattering_batch(q, xyz_traj, ctx)
+
+    dS0 = (
+        (S0 - ctx["self_scatter"][None, None, :])
+        / ctx["fe"][None, None, :]
+    )
+
+    dS0 *= detector[None, None, :]
+
+    # DBT expects:
+    # (q, frames)
+
+    n_traj_out, n_frames, nq = dS0.shape
+
+    pd_limited = []
+    R_grid = None
+
+    for ti in range(n_traj_out):
+
+        pd_l, R_grid = DBT(0, dS0[ti].T, q, M)
+        pd_limited.append(pd_l.T.astype(np.float32))
+
+    pd_limited = np.stack(pd_limited)
+    pd_true = compute_ground_truth_pd_batch(r_ab, ctx["pair_weights"], R_grid)
+
+    np.savez_compressed(
+        out_path,
+
+        pd_limited=pd_limited,
+        pd_true=pd_true,
+
+        V_vib=V_vib.astype(np.float32),
+        omegas_ASE=omegas_ASE.astype(np.float32),
+
+        R_grid=R_grid.astype(np.float32),
+        time_fs=time_fs.astype(np.float32),
+
+        mol_idx=np.array(mol_idx),
+    )
+
+
+
 if __name__ == "__main__":
-    mat_path = "processing/DemoMatlabData/h2o_xyzt_minimal.mat"
-    output_path = "processing/figures/recov_pchip.png"
-    fig = run_pipeline(mat_path, output_path)
-    fig.show()
+    data_dir = Path("data/mol_data")
+    out_dir = Path("data/trajectory_data")
+
+    for npz_path in data_dir.glob("*.npz"):
+        result = process_molecule(npz_path=npz_path, out_dir=out_dir)
+        if result:
+            print(result)
+
+    # mat_path = "processing/DemoMatlabData/h2o_xyzt_minimal.mat"
+    # output_path = "processing/figures/test.png"
+    # fig = run_pipeline(mat_path, output_path)

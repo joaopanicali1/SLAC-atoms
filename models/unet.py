@@ -67,37 +67,26 @@ class CrossAttentionBottleneck(nn.Module):
         super().__init__()
 
         self.attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            kdim=channels,
-            vdim=channels,
+            embed_dim=channels,
+            kdim=d_model,
+            vdim=d_model,
             num_heads=n_heads,
             batch_first=True
         )
 
-        self.out_proj = nn.Linear(d_model, channels)
-        self.mode_to_r = nn.Linear(d_model, n_R)
         self.norm = nn.LayerNorm(channels)
 
     def forward(self, bottleneck, mode_embeddings, mode_mask):
-        batch, channels, n_R = bottleneck.shape
         kv = bottleneck.permute(0, 2, 1) # (batch, n_R, channels)
 
         attn_out, _ = self.attn(
-            query=mode_embeddings,
-            key=kv,
-            value=kv,
-            key_padding_mask=None
+            query=kv,
+            key=mode_embeddings,
+            value=mode_embeddings,
+            key_padding_mask=~mode_mask
         )
-
-        attn_out = attn_out * mode_mask.unsqueeze(-1).float()
-
-        n_real = mode_mask.sum(dim=1, keepdim=True).unsqueeze(-1).float()
-        pooled = attn_out.sum(dim=1) / n_real.squeeze(1)
-
-        out = self.out_proj(pooled)
-        out = out.unsqueeze(-1).expand(-1, -1, n_R)
-        out = self.norm((bottleneck + out).permute(0, 2, 1)).permute(0, 2, 1)
-        return out
+        out = self.norm(kv + attn_out)
+        return out.permute(0, 2, 1)
 
 
 class PairDensityUNet(nn.Module):

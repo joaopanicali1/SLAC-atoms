@@ -9,48 +9,57 @@ class MolScatteringDataset(Dataset):
     Each item is one (trajectory, frame) pair from one molecule.
     
     Returns:
-        pd_limited  : (n_R,)        - bandlimited scattering signal (input)
-        pd_true     : (n_R,)        - ground truth pair distribution (target)
-        R_grid      : (n_R,)        - real-space grid in Angstrom
-        time_fs     : scalar        - time of this frame
+        pd_limited: (n_R,) - bandlimited scattering signal (input)
+        pd_true: (n_R,) - ground truth pair distribution (target)
+        R_grid: (n_R,) - real-space grid in Angstrom
+        time_fs: scalar - time of this frame
         mol_features: (n_mol_feat,) - per-molecule features (atomic numbers, charge, etc.)
-        omegas_ASE  : (n_modes,)    - vibrational frequencies
-        V_vib       : (3N, n_modes) - normal mode eigenvectors
+        omegas_ASE: (n_modes,) - vibrational frequencies
+        V_vib: (3N, n_modes) - normal mode eigenvectors
+        mode_mask: (max_modes,) - True for real modes, False for padding
+        atom_mask: (max_atoms,) - True for real atoms, False for padding
+        mol_idx: int - metadata for debugging
+        traj_idx: int - metadata for debugging
+        frame_idx: int - metadata for debugging
     """
     def __init__(
         self,
-        data_dir: str | Path,
-        db_path: str | Path,
+        data_dir: str or Path,
+        db_path: str or Path,
         flatten_traj: bool = True, # treat each (traj, frame) as independent sample
-        max_atoms: int = 350, # for padding atomic numbers
+        max_atoms: int = 50, # for padding atomic numbers
+        max_modes: int = 144
     ):
         self.data_dir = Path(data_dir)
         self.flatten_traj = flatten_traj
         self.max_atoms = max_atoms
+        self.max_modes = max_modes
         self.db = connect(str(db_path))
         
         self.files = sorted(self.data_dir.glob("mol_*_pd.npz"))
         
         # build flat index: list of (file_idx, traj_idx, frame_idx)
         self._index = []
-        self._cache = {}
+        self._mol_features_cache = {}
         
         for fi, fpath in enumerate(self.files):
             data = np.load(fpath)
+            mol_idx = int(data["mol_idx"])
+
             n_traj, n_frames, n_R = data["pd_limited"].shape
             for ti in range(n_traj):
                 for fr in range(n_frames):
                     self._index.append((fi, ti, fr))
+            if mol_idx not in self._mol_features_cache:
+                self._mol_features_cache[mol_idx] = self._compute_mol_features(mol_idx)
         
     def __len__(self):
         return len(self._index)
     
     def _load_file(self, fi):
-        if fi not in self._cache:
-            self._cache[fi] = np.load(self.files[fi])
-        return self._cache[fi]
+        return np.load(self.files[fi])
     
-    def _get_mol_features(self, mol_idx: int, data) -> torch.Tensor:
+    def _compute_mol_features(self, mol_idx: int) -> torch.Tensor:
         """
         Pull per-molecule features from ASE db.
         Returns a fixed-size feature vector.
@@ -77,23 +86,39 @@ class MolScatteringDataset(Dataset):
         
         mol_idx = int(data["mol_idx"])
         
-        pd_limited = torch.from_numpy(data["pd_limited"][ti, fr])   # (n_R,)
-        pd_true = torch.from_numpy(data["pd_true"][ti, fr])      # (n_R,)
-        R_grid = torch.from_numpy(data["R_grid"])               # (n_R,)
+        pd_limited = torch.from_numpy(data["pd_limited"][ti, fr]) # (n_R,)
+        pd_true = torch.from_numpy(data["pd_true"][ti, fr]) # (n_R,)
+        R_grid = torch.from_numpy(data["R_grid"]) # (n_R,)
         time_fs = torch.tensor(data["time_fs"][fr], dtype=torch.float32)
-        omegas = torch.from_numpy(data["omegas_ASE"])           # (n_modes,)
-        V_vib = torch.from_numpy(data["V_vib"])                # (3N, n_modes)
-        
-        mol_features = self._get_mol_features(mol_idx, data)
+
+        omegas_raw = data["omegas_ASE"] # (n_modes,)
+        V_vib_raw = data["V_vib"] # (3N, n_modes)
+
+        three_N, n_modes = V_vib_raw.shape
+        n_atoms = three_N // 3
+        atom_mask = torch.zeros(self.max_atoms, dtype = torch.bool)
+        atom_mask[:n_atoms] = True
+
+
+        V_vib_padded = np.zeros((3 * self.max_atoms, self.max_modes), dtype=np.float32)
+        V_vib_padded[:three_N, :n_modes] = V_vib_raw
+
+        omegas_padded = np.zeros(self.max_modes, dtype=np.float32)
+        omegas_padded[:n_modes] = omegas_raw
+
+        mode_mask = torch.zeros(self.max_modes, dtype=torch.bool)
+        mode_mask[:n_modes] = True
         
         return {
             "pd_limited": pd_limited,
             "pd_true": pd_true,
             "R_grid": R_grid,
             "time_fs": time_fs,
-            "mol_features": mol_features,
-            "omegas_ASE": omegas,
-            "V_vib": V_vib,
+            "mol_features": self._mol_features_cache[mol_idx],
+            "omegas_ASE": torch.from_numpy(omegas_padded),
+            "V_vib": torch.from_numpy(V_vib_padded),
+            "mode_mask": mode_mask,
+            "atom_mask": atom_mask,
             "mol_idx": mol_idx,
             "traj_idx": ti,
             "frame_idx": fr,

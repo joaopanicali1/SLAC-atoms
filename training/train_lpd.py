@@ -134,11 +134,11 @@ if __name__ == "__main__":
     print(f"Dataset: {len(dataset):,} samples from {len(dataset.files)} molecules")
 
     # Build DBT operator from the dataset's q and R grids (same for all molecules).
+    # M is derived from len(R_grid) directly — avoids floating point rounding errors
+    # that arise from computing dR via R_grid[1]-R_grid[0] (Bessel-zero grid, not uniform).
     q_np = dataset.q.numpy()
     R_np = dataset.R_grid.numpy()
-    dq   = float(q_np[1] - q_np[0])
-    dR   = float(R_np[1] - R_np[0])
-    M    = int(np.ceil(np.pi / (dR * dq))) + 1
+    M    = len(R_np) + 1   # nR = M-1, so M = nR + 1
     print(f"Building A_dbt (M={M}) ...")
     A_dbt, _ = build_dbt_operator(q_np, M)
 

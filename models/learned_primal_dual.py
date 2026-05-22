@@ -34,6 +34,83 @@ Usage
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy.interpolate import PchipInterpolator
+from scipy.special import spherical_jn
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DBT — Discrete Bessel Transform (port of Natan group MATLAB DBT.m)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _bessel_zeros_spherical(n: int, k: int) -> np.ndarray:
+    """First k positive zeros of the spherical Bessel function j_n."""
+    coeff1 = [0.411557013144507, 0.999986723293410, 0.698028985524484, 1.06977507291468]
+    exp1   = [0.335300369843979, 0.339671493811664]
+    coeff2 = [1.93395115137444, 1.00007656297072, -0.805720018377132, 3.38764629174694]
+    exp2   = [0.456215294517928, 0.388380341189200]
+    coeff3 = [5.40770803992613, 1.00093850589418, 2.66926179799040, -0.174925559314932]
+    exp3   = [0.429702214054531, 0.633480051735955]
+
+    zeros = np.zeros(k)
+
+    def _guess1(n): return coeff1[0] + coeff1[1]*n + coeff1[2]*(n+1)**exp1[0] + coeff1[3]*(n+1)**exp1[1]
+    def _guess2(n): return coeff2[0] + coeff2[1]*n + coeff2[2]*(n+1)**exp2[0] + coeff2[3]*(n+1)**exp2[1]
+    def _guess3(n): return coeff3[0] + coeff3[1]*n + coeff3[2]*(n+1)**exp3[0] + coeff3[3]*(n+1)**exp3[1]
+
+    def halley(n_ord, x0):
+        x = x0
+        TOL = 1e4 * np.finfo(float).eps
+        for _ in range(100):
+            a = spherical_jn(n_ord, x)
+            b = spherical_jn(n_ord + 1, x)
+            x2 = x * x
+            denom = 2*b*b*x2 - a*b*x*(4*n_ord+1) + (n_ord*(n_ord+1) + x2)*a*a
+            if abs(denom) < 1e-300:
+                break
+            err = 2*a*x*(n_ord*a - b*x) / denom
+            x -= err
+            if abs(err) < TOL * abs(x):
+                break
+        return x
+
+    zeros[0] = halley(n, _guess1(n))
+    if k >= 2: zeros[1] = halley(n, _guess2(n))
+    if k >= 3: zeros[2] = halley(n, _guess3(n))
+    for i in range(3, k):
+        zeros[i] = halley(n, 2*zeros[i-1] - zeros[i-2])
+    return zeros
+
+
+def _dbt(n: int, data: np.ndarray, q: np.ndarray, M: int) -> tuple[np.ndarray, np.ndarray]:
+    """Discrete Bessel Transform of order n. Returns (PD, Rgrid)."""
+    if data.ndim == 1:
+        data = data[:, np.newaxis]
+        squeeze_out = True
+    else:
+        squeeze_out = False
+
+    dq     = q[1] - q[0]
+    qp_end = q[0] + dq * (M - 1)
+    BZ     = _bessel_zeros_spherical(n, M)
+
+    qgrid = qp_end * BZ[:M-1] / BZ[M-1]
+    Rgrid = BZ[:M-1] / qp_end
+
+    in_range = (qgrid >= q[0]) & (qgrid <= q[-1])
+    data_s = np.zeros((M-1, data.shape[1]))
+    if np.any(in_range):
+        interp = PchipInterpolator(q, data, axis=0, extrapolate=False)
+        data_s[in_range] = interp(qgrid[in_range])
+
+    scalingFactor = qp_end**2 / BZ[M-1]
+    bz_inner = BZ[:M-1]
+    denom = BZ[M-1] * spherical_jn(n+1, bz_inner)**2
+    G = 2 * spherical_jn(n, np.outer(bz_inner, bz_inner) / BZ[M-1]) / denom[:, np.newaxis]
+
+    PD = G @ (data_s * qgrid[:, np.newaxis]) * scalingFactor
+    if squeeze_out:
+        PD = PD[:, 0]
+    return PD, Rgrid
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -44,10 +121,7 @@ def build_dbt_operator(q: np.ndarray, M: int, verbose: bool = True):
     """
     Build the DBT operator as a dense matrix A_dbt of shape (nR, nq).
 
-    A_dbt[:, j] = DBT(e_j, q, M)  where e_j is the j-th standard basis vector.
-
-    The DBT function is imported from processing/analyse_mol_dbt.py, which
-    implements the exact MATLAB DBT.m methodology (Natan 2020).
+    A_dbt[:, j] = _dbt(e_j, q, M)  where e_j is the j-th standard basis vector.
 
     Parameters
     ----------
@@ -60,20 +134,15 @@ def build_dbt_operator(q: np.ndarray, M: int, verbose: bool = True):
     A_dbt : torch.Tensor  (nR, nq)  float32
     Rgrid : torch.Tensor  (nR,)     float32  [Å]
     """
-    import sys
-    import os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'processing'))
-    from analyse_mol_v2 import DBT
-
     nq = len(q)
     e0 = np.zeros(nq); e0[0] = 1.0
-    col0, Rgrid_np = DBT(0, e0, q, M)
+    col0, Rgrid_np = _dbt(0, e0, q, M)
     nR = len(col0)
 
     A = np.zeros((nR, nq), dtype=np.float32)
     for j in range(nq):
         e_j = np.zeros(nq); e_j[j] = 1.0
-        A[:, j], _ = DBT(0, e_j, q, M)
+        A[:, j], _ = _dbt(0, e_j, q, M)
 
     if verbose:
         print(f'A_dbt  : {A.shape}  ({A.nbytes / 1e6:.1f} MB)')
@@ -107,6 +176,10 @@ class DualNet(nn.Module):
             nn.PReLU(n_channels),
             nn.Conv1d(n_channels, n_dual,     kernel_size, padding=pad),
         )
+        # Zero-init last layer so residual path starts as identity at init,
+        # preventing exponential blow-up across the unrolled iterations.
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, h: torch.Tensor, Tf: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         """
@@ -137,6 +210,8 @@ class PrimalNet(nn.Module):
             nn.PReLU(n_channels),
             nn.Conv1d(n_channels,   n_primal,   kernel_size, padding=pad),
         )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, f: torch.Tensor, Tstar_h: torch.Tensor) -> torch.Tensor:
         """

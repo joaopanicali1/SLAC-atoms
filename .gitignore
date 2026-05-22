@@ -1,5 +1,6 @@
 train_4M/
 orca_scratch/
+trajectory_data/
 train_4M.db
 openmpi-4.1.8/
 orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg/
@@ -11,7 +12,6 @@ env_orca.sh
 jupyter_gpu.slurm
 jupyter_cpu.slurm
 test_results/
-mol_data/
 .DS_Store
 SLAC-atoms.code-workspace
 requirements.txt
@@ -21,3 +21,4 @@ orca_scratch_tmp
 __pycache__/
 checkpoints/
 logs/
+trajectory_data_cap200/

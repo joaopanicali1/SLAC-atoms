@@ -124,6 +124,7 @@ def simulate_scattering_batch(
     q: np.ndarray,
     xyz_traj: np.ndarray,
     scattering_ctx: dict,
+    frame_batch: int | None = None,
 ):
     """
     Vectorized Debye scattering simulation.
@@ -132,6 +133,12 @@ def simulate_scattering_batch(
     ----------
     xyz_traj:
         (n_traj, n_frames, N, 3)
+    frame_batch:
+        If None (default), compute all frames at once — original behaviour,
+        but can OOM for large molecules with many frames.
+        If an int, process that many frames at a time, capping peak RAM at
+        O(frame_batch * nq * n_pairs) instead of O(n_traj * n_frames * nq * n_pairs).
+        A value of 32 keeps peak usage under ~1 GB for all molecules in the dataset.
 
     Returns
     -------
@@ -142,7 +149,7 @@ def simulate_scattering_batch(
     """
 
     all_pairs = scattering_ctx["all_pairs"]
-    fafb = scattering_ctx["fafb"]
+    fafb = scattering_ctx["fafb"]       # (nq, n_pairs)
     self_scatter = scattering_ctx["self_scatter"]
 
     diff = (
@@ -150,24 +157,29 @@ def simulate_scattering_batch(
         - xyz_traj[:, :, all_pairs[:, 0], :]
     )
 
-    r_ab = np.linalg.norm(diff, axis=-1)
+    r_ab = np.linalg.norm(diff, axis=-1)   # (n_traj, n_frames, n_pairs)
 
-    qr = (
-        q[None, None, :, None]
-        * r_ab[:, :, None, :]
-    )
-
-    bessel = np.sinc(qr / np.pi)
-
-    pair_sum = np.sum(
-        fafb[None, None, :, :] * bessel,
-        axis=-1,
-    )
-
-    S0 = (
-        self_scatter[None, None, :]
-        + 2 * pair_sum
-    )
+    if frame_batch is None:
+        # Original fully-vectorized path
+        qr = (
+            q[None, None, :, None]
+            * r_ab[:, :, None, :]
+        )
+        bessel = np.sinc(qr / np.pi)
+        pair_sum = np.sum(fafb[None, None, :, :] * bessel, axis=-1)
+        S0 = self_scatter[None, None, :] + 2 * pair_sum
+    else:
+        # Memory-efficient path: loop over trajectories and frame chunks
+        n_traj, n_frames, _ = r_ab.shape
+        nq = len(q)
+        S0 = np.empty((n_traj, n_frames, nq), dtype=np.float64)
+        for ti in range(n_traj):
+            for f0 in range(0, n_frames, frame_batch):
+                f1 = min(f0 + frame_batch, n_frames)
+                qr = q[None, :, None] * r_ab[ti, f0:f1, None, :]  # (batch_f, nq, n_pairs)
+                bessel = np.sinc(qr / np.pi)
+                pair_sum = np.sum(fafb[None, :, :] * bessel, axis=-1)  # (batch_f, nq)
+                S0[ti, f0:f1, :] = self_scatter[None, :] + 2 * pair_sum
 
     return S0, r_ab
 
@@ -628,12 +640,22 @@ def generate_trajectory_batch(
     n_traj: int = 30,
     points_per_fast_cycle: int = 10,
     seed: int = 42,
+    max_frames: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Returns
     -------
     time_fs  : (n_frames,)
     xyz_traj : (n_traj, n_frames, N, 3)
+
+    Parameters
+    ----------
+    max_frames:
+        If None (default), the trajectory spans one full period of the slowest
+        mode — original behaviour. If an int, the time grid is truncated to at
+        most max_frames regardless of the slowest/fastest period ratio.
+        Phase-space coverage is preserved across trajectories because each of
+        the n_traj realizations uses independent random initial phases.
     """
     rng = np.random.default_rng(seed)
     N = len(R0_flat) // 3
@@ -645,6 +667,8 @@ def generate_trajectory_batch(
     t_total_fs = np.max(periods_fs)
     dt_fs = np.min(periods_fs) / points_per_fast_cycle
     time_fs = np.arange(0, t_total_fs + dt_fs, dt_fs)
+    if max_frames is not None and len(time_fs) > max_frames:
+        time_fs = time_fs[:max_frames]
     num_frames = len(time_fs)
     time_ASE = (time_fs * _ase_units.fs).reshape(-1, 1)
 
@@ -712,7 +736,9 @@ def process_molecule(
     dR: float = 0.025,
     T_kelvin: float = 300.0,
     n_traj: int = 30,
-    points_per_fast_cycle: int = 10):
+    points_per_fast_cycle: int = 10,
+    max_frames: int | None = None,
+):
 
 
     match = re.search(r'mol_(\d+)_physics', npz_path.stem)
@@ -743,6 +769,7 @@ def process_molecule(
             n_traj=n_traj,
             points_per_fast_cycle=points_per_fast_cycle,
             seed=mol_idx,
+            max_frames=max_frames,
         )
     except ValueError as e:
         return f"SKIP {npz_path.name}: {e}"
@@ -757,7 +784,7 @@ def process_molecule(
 
     ctx = build_scattering_context(atom_names, q)
 
-    S0, r_ab = simulate_scattering_batch(q, xyz_traj, ctx)
+    S0, r_ab = simulate_scattering_batch(q, xyz_traj, ctx, frame_batch=32)
 
     dS0 = (
         (S0 - ctx["self_scatter"][None, None, :])
@@ -788,10 +815,16 @@ def process_molecule(
         pd_limited=pd_limited,
         pd_true=pd_true,
 
+        S0=S0.astype(np.float32),
+        dS0=dS0.astype(np.float32),
+        self_scatter=ctx["self_scatter"].astype(np.float32),
+        fe=ctx["fe"].astype(np.float32),
+
         V_vib=V_vib.astype(np.float32),
         omegas_ASE=omegas_ASE.astype(np.float32),
 
         R_grid=R_grid.astype(np.float32),
+        q=q.astype(np.float32),
         time_fs=time_fs.astype(np.float32),
 
         mol_idx=np.array(mol_idx),
@@ -800,11 +833,23 @@ def process_molecule(
 
 
 if __name__ == "__main__":
-    data_dir = Path("data/mol_data")
-    out_dir = Path("data/trajectory_data")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out-dir", default="data/trajectory_data")
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="Cap trajectory length (None = full slowest-mode period)")
+    args = parser.parse_args()
 
-    for npz_path in data_dir.glob("*.npz"):
-        result = process_molecule(npz_path=npz_path, out_dir=out_dir)
+    data_dir = Path("data/mol_data")
+    out_dir  = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for npz_path in sorted(data_dir.glob("*.npz")):
+        result = process_molecule(
+            npz_path=npz_path,
+            out_dir=out_dir,
+            max_frames=args.max_frames,
+        )
         if result:
             print(result)
 

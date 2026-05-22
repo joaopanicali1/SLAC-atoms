@@ -10,6 +10,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from data.Dataset.dataset_lpd import LPDDataset
 from models.learned_primal_dual import LearnedPrimalDual, build_dbt_operator
 
+PD_SCALE = 100.0  # pd_true is weighted by Z_iZ_j (max ~240); scale to O(1) for training
+
 
 def warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps):
     """Linear warmup for n_warmup_steps, then cosine decay to 0."""
@@ -35,7 +37,10 @@ def run_epoch(model, loader, optimizer, scheduler, device, train=True):
             pd_true = batch["pd_true"].to(device)  # (batch, nR)
 
             pred = model(dS0)
-            loss = nn.functional.mse_loss(pred, pd_true)
+            # pd_true values are weighted by Z_iZ_j (up to ~240) making raw MSE
+            # ~45k at init, causing gradient explosion through 10 unrolled iters.
+            # Scale to O(1) before computing loss; model output is in same units.
+            loss = nn.functional.mse_loss(pred / PD_SCALE, pd_true / PD_SCALE)
 
             if train:
                 optimizer.zero_grad()
@@ -161,14 +166,14 @@ if __name__ == "__main__":
 
     train_loader = DataLoader(
         Subset(dataset, train_idx),
-        batch_size=32,
+        batch_size=256,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
     )
     val_loader = DataLoader(
         Subset(dataset, val_idx),
-        batch_size=32,
+        batch_size=256,
         shuffle=False,
         num_workers=4,
         pin_memory=True,

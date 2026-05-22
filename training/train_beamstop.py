@@ -3,14 +3,42 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+from pathlib import Path
 from torch.utils.data import DataLoader, Subset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from data.Dataset.dataset_beamstop import BeamstopDataset
-from models.beamstop import BeamstopModel, build_sinc_operator, smoothness_loss
+from models.beamstop import BeamstopModel, build_sinc_operator, masked_loss
 
-LAMBDA_SMOOTH = 1e-3   # weight of second-derivative penalty in total loss
+
+def compute_dataset_R_max(data_dir, margin=1.2):
+    """
+    Find the largest interatomic distance present in any frame of any molecule
+    by scanning the saved pd_true arrays (which are histograms over R bins).
+
+    Adds a multiplicative margin so the truncated R-grid covers slightly more
+    than any observed pair distance. Returning R_max < ~31 Å (the default
+    npz grid limit) removes excess R-space degrees of freedom — those extra
+    bins can only fit noise, which is especially damaging in the low-q region
+    the beamstop model is trying to recover.
+    """
+    max_R   = 0.0
+    R_grid  = None
+    for fpath in sorted(Path(data_dir).glob("mol_*_pd.npz")):
+        d = np.load(fpath)
+        if R_grid is None:
+            R_grid = d["R_grid"]
+        nonzero = (d["pd_true"] > 0).any(axis=(0, 1))   # (nR,)
+        idx     = np.where(nonzero)[0]
+        if len(idx) > 0:
+            max_R = max(max_R, float(R_grid[idx.max()]))
+    return max_R * margin
+
+
+def build_truncated_R_grid(R_max, dR=0.025, R_min=0.025):
+    """Uniform R-grid from R_min up to R_max."""
+    return np.arange(R_min, R_max + dR, dR, dtype=np.float32)
 
 
 def warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps):
@@ -23,7 +51,8 @@ def warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps):
     return LambdaLR(optimizer, lr_lambda)
 
 
-def run_epoch(model, loader, optimizer, scheduler, device, train=True):
+def run_epoch(model, loader, optimizer, scheduler, device,
+              use_conditioning, lambda_masked, lambda_smooth, train=True):
     model.train() if train else model.eval()
 
     total_loss = 0.0
@@ -33,15 +62,24 @@ def run_epoch(model, loader, optimizer, scheduler, device, train=True):
 
     with context:
         for batch in loader:
-            delta_S0_masked = batch["delta_S0_masked"].to(device)  # (batch, nq)
-            delta_S0_norm   = batch["delta_S0_norm"].to(device)    # (batch, nq)
-            mask            = batch["mask"].to(device)             # (batch, nq)
+            delta_S0_masked = batch["delta_S0_masked"].to(device)
+            delta_S0_norm   = batch["delta_S0_norm"].to(device)
+            mask            = batch["mask"].to(device)
 
-            pred = model(delta_S0_masked, mask)                    # (batch, nq)
+            if use_conditioning:
+                pred = model(
+                    delta_S0_masked, mask,
+                    batch["V_vib"].to(device),
+                    batch["omegas"].to(device),
+                    batch["atom_mask"].to(device),
+                    batch["mode_mask"].to(device),
+                )
+            else:
+                pred = model(delta_S0_masked, mask)
 
-            mse  = nn.functional.mse_loss(pred, delta_S0_norm)
-            smooth = smoothness_loss(pred, mask)
-            loss = mse + LAMBDA_SMOOTH * smooth
+            loss = masked_loss(pred, delta_S0_norm, mask,
+                               lambda_masked=lambda_masked,
+                               lambda_smooth=lambda_smooth)
 
             if train:
                 optimizer.zero_grad()
@@ -64,6 +102,9 @@ def train(
     lr=1e-3,
     n_warmup_epochs=5,
     n_channels=32,
+    use_conditioning=True,
+    lambda_masked=10.0,
+    lambda_smooth=1e-3,
     checkpoint_dir="checkpoints/beamstop",
     device=None,
 ):
@@ -71,16 +112,21 @@ def train(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Training on {device}")
+    print(f"use_conditioning : {use_conditioning}")
+    print(f"lambda_masked    : {lambda_masked}")
+    print(f"lambda_smooth    : {lambda_smooth}")
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs("logs", exist_ok=True)
 
-    model = BeamstopModel(B_sinc, n_channels=n_channels, kernel_size=5).to(device)
+    model = BeamstopModel(
+        B_sinc, n_channels=n_channels, kernel_size=5,
+        use_conditioning=use_conditioning,
+    ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters : {n_params:,}")
     print(f"B_sinc shape     : {tuple(B_sinc.shape)}  ({B_sinc.nbytes / 1e6:.1f} MB)")
-    print(f"Smoothness weight: {LAMBDA_SMOOTH}")
 
     optimizer = AdamW(model.parameters(), lr=lr)
 
@@ -93,8 +139,10 @@ def train(
     best_val_loss = float("inf")
 
     for epoch in range(1, n_epochs + 1):
-        train_loss = run_epoch(model, train_loader, optimizer, scheduler, device, train=True)
-        val_loss   = run_epoch(model, val_loader,   optimizer, scheduler, device, train=False)
+        train_loss = run_epoch(model, train_loader, optimizer, scheduler, device,
+                               use_conditioning, lambda_masked, lambda_smooth, train=True)
+        val_loss   = run_epoch(model, val_loader,   optimizer, scheduler, device,
+                               use_conditioning, lambda_masked, lambda_smooth, train=False)
 
         curr_lr = scheduler.get_last_lr()[0]
 
@@ -131,20 +179,33 @@ def train(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-channels",      type=int,   default=32,                      help="Hidden channels in encoder CNNs")
-    parser.add_argument("--checkpoint-dir",  type=str,   default="checkpoints/beamstop",  help="Directory to save checkpoints")
+    parser.add_argument("--n-channels",       type=int,   default=32,                      help="Hidden channels in encoder CNNs")
+    parser.add_argument("--checkpoint-dir",   type=str,   default="checkpoints/beamstop",  help="Directory to save checkpoints")
+    parser.add_argument("--use-conditioning", action="store_true", default=False,           help="Enable FiLM conditioning on normal modes")
+    parser.add_argument("--lambda-masked",    type=float, default=10.0,                    help="Upweight factor for masked (low-q) loss region")
+    parser.add_argument("--lambda-smooth",    type=float, default=0.0,                     help="Smoothness penalty weight (default 0; B_sinc is band-limited by construction)")
+    parser.add_argument("--R-margin",         type=float, default=1.2,                     help="Multiplicative margin on max interatomic distance for R-grid truncation")
+    parser.add_argument("--no-pin-memory",    action="store_true", default=False,           help="Disable pin_memory in DataLoader (use on nodes where IPC is unreliable)")
     args = parser.parse_args()
 
     data_dir = "data/trajectory_data_cap200"
 
-    dataset = BeamstopDataset(data_dir, q_min_lo=0.5, q_min_hi=1.0)
+    dataset = BeamstopDataset(data_dir, q_min_lo=0.5, q_min_hi=1.0,
+                              max_atoms=75, max_modes=219,
+                              use_conditioning=args.use_conditioning)
     print(f"Dataset: {len(dataset):,} samples from {len(dataset.files)} molecules")
 
-    # Build sinc operator from dataset grids (same for all molecules).
-    q_np   = dataset.q.numpy()
-    R_np   = dataset.R_grid.numpy()
+    # Build data-driven R-grid: truncate to ~1.2× max interatomic distance.
+    # Removes excess R-space DoF that can only fit low-q noise.
+    print("Scanning dataset for max interatomic distance ...")
+    R_max = compute_dataset_R_max(data_dir, margin=args.R_margin)
+    dR    = float(dataset.R_grid[1] - dataset.R_grid[0])
+    R_grid_truncated = build_truncated_R_grid(R_max, dR=dR)
+    print(f"R_max (margin={args.R_margin}): {R_max:.2f} Å  |  R-grid: {len(R_grid_truncated)} pts (was {len(dataset.R_grid)})")
+
+    q_np = dataset.q.numpy()
     print("Building B_sinc ...")
-    B_sinc = build_sinc_operator(q_np, R_np)
+    B_sinc = build_sinc_operator(q_np, R_grid_truncated)
 
     # File-level train/val split.
     n_files = len(dataset.files)
@@ -163,20 +224,26 @@ if __name__ == "__main__":
 
     print(f"Train samples: {len(train_idx):,}  |  Val samples: {len(val_idx):,}")
 
+    pin_memory = not args.no_pin_memory
+    print(f"pin_memory       : {pin_memory}")
+
     train_loader = DataLoader(
         Subset(dataset, train_idx),
         batch_size=32,
         shuffle=True,
         num_workers=4,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         Subset(dataset, val_idx),
         batch_size=32,
         shuffle=False,
         num_workers=4,
-        pin_memory=True,
+        pin_memory=pin_memory,
     )
 
     train(train_loader=train_loader, val_loader=val_loader, B_sinc=B_sinc,
-          n_channels=args.n_channels, checkpoint_dir=args.checkpoint_dir)
+          n_channels=args.n_channels, checkpoint_dir=args.checkpoint_dir,
+          use_conditioning=args.use_conditioning,
+          lambda_masked=args.lambda_masked,
+          lambda_smooth=args.lambda_smooth)

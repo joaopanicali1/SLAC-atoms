@@ -11,23 +11,32 @@ trajectory, analogous to the pre-pump ground-state measurement in TRXSS.
 Physics constraints enforced by construction:
   1. ΔS0_norm(q=0) = 0  — because S0(q=0) = (ΣZ_i)² is geometry-independent,
                            enforced by zero-centering the R-space intermediate
-  2. Smoothness            — enforced via second-derivative loss penalty in training
+  2. Smoothness            — enforced via second-derivative loss penalty
 
-Architecture (physics-guided encoder-decoder):
-  Encoder : Conv1d in q-space → linear interpolation to nR → Conv1d in R-space
-            → ΔPD_eff (batch, nR)   [learned]
-  Decoder : zero-center(ΔPD_eff) @ B_sinc → ΔS0_norm_pred (batch, nq)  [fixed physics]
+Architecture (physics-guided encoder-decoder with mode-embedding FiLM conditioning):
+  MolEmbedding : V_vib + omegas + masks → mol_cond (d_cond,)
+                   per-atom MLP per mode → masked atom pool → cat ω
+                   → per-mode embed → masked mode pool → single vector
+  Encoder      : Conv1d in q-space, FiLM-conditioned on mol_cond
+                   → interpolate to nR
+                   → Conv1d in R-space, FiLM-conditioned on mol_cond
+                   → ΔPD_eff (batch, nR)
+  Decoder      : zero-center(ΔPD_eff) @ B_sinc → ΔS0_norm_pred (batch, nq)  [fixed]
 
-The forward operator B_sinc (nR × nq) is the plain sinc/Debye matrix:
-  B_sinc[j, i] = 2 · sin(q[i] · R[j]) / (q[i] · R[j])
-No Lorch window — ΔS0_norm is not windowed.
+FiLM (Feature-wise Linear Modulation) applies per-channel scale γ and shift β
+derived from mol_cond after each activation: out = γ(mol_cond) * act + β(mol_cond).
+Initialized to identity (γ=1, β=0) so conditioning starts neutral.
+
+Loss (masked_loss):
+  Masked upweighting  — masked (low-q) MSE upweighted by lambda_masked
+                         relative to observed MSE, both per-q-point normalized
 
 Usage
 -----
     from models.beamstop import BeamstopModel, build_sinc_operator
     B_sinc = build_sinc_operator(q_np, R_grid_np)
-    model  = BeamstopModel(B_sinc)
-    pred   = model(delta_S0_masked, mask)   # (batch, nq)
+    model  = BeamstopModel(B_sinc, max_atoms=75, max_modes=219)
+    pred   = model(delta_S0_masked, mask, V_vib, omegas, atom_mask, mode_mask)
 """
 
 import numpy as np
@@ -46,14 +55,8 @@ def build_sinc_operator(q: np.ndarray, R_grid: np.ndarray, verbose: bool = True)
 
     B_sinc[j, i] = 2 · sin(q[i] · R[j]) / (q[i] · R[j])
 
-    Satisfies: ΔS0_norm(q) ≈ ΔPD_eff @ B_sinc  (approximate, ignoring form-factor
-    q-dependence which is weak at low q where the model operates).
-
-    The factor 2 reflects the Debye double-counting convention:
-        (S0 − Σf²) / fe = 2 Σ_{k<l} (f_k f_l / fe) sinc(q R_kl)
-
     At q ≈ 0: B_sinc[:, 0] → 2 for all R, so zero-centering ΔPD_eff before
-    projecting guarantees ΔS0_norm(q=0) = 2 · sum(ΔPD_eff) = 0.
+    projecting guarantees ΔS0_norm(q=0) = 0.
 
     Parameters
     ----------
@@ -66,60 +69,185 @@ def build_sinc_operator(q: np.ndarray, R_grid: np.ndarray, verbose: bool = True)
     """
     qR = np.outer(R_grid, q)
     B  = np.where(np.abs(qR) < 1e-10, 2.0, 2.0 * np.sin(qR) / qR)
-
     if verbose:
         print(f'B_sinc : {B.shape}  ({B.nbytes / 1e6:.1f} MB)')
-
     return torch.tensor(B, dtype=torch.float32)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Encoder — q-space signal → R-space representation
+# FiLM — Feature-wise Linear Modulation
+# ═════════════════════════════════════════════════════════════════════════════
+
+class FiLM(nn.Module):
+    """
+    Per-channel affine conditioning: out = (1 + γ(cond)) * x + β(cond).
+
+    Initialized to identity (all weights/biases zero → γ=1, β=0) so the
+    conditioning has no effect at the start of training.
+
+    Parameters
+    ----------
+    n_channels : channels in the feature map to be modulated
+    d_cond     : dimension of the conditioning vector
+    """
+    def __init__(self, n_channels: int, d_cond: int):
+        super().__init__()
+        self.proj = nn.Linear(d_cond, 2 * n_channels)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """x: (batch, n_ch, L)  cond: (batch, d_cond)"""
+        gb    = self.proj(cond)
+        n_ch  = gb.shape[1] // 2
+        gamma = gb[:, :n_ch].unsqueeze(-1) + 1.0
+        beta  = gb[:, n_ch:].unsqueeze(-1)
+        return gamma * x + beta
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MolEmbedding — normal modes → single conditioning vector
+# ═════════════════════════════════════════════════════════════════════════════
+
+class MolEmbedding(nn.Module):
+    """
+    Encodes normal-mode eigenvectors and frequencies into a single conditioning
+    vector used by FiLM layers throughout the encoder.
+
+    Pipeline per molecule:
+      1. V_vib (3*max_atoms, max_modes) → (max_modes, max_atoms, 3)
+      2. atom_mlp applied to the last dim (3,): → (max_modes, max_atoms, d_atom)
+      3. Masked mean-pool over atoms (using atom_mask) → (max_modes, d_atom)
+      4. Concatenate ω_k → (max_modes, d_atom+1)
+      5. Linear out_proj → (max_modes, d_mode)
+      6. Thermal-amplitude-weighted pool over modes:
+         weight_k ∝ 1/ω_k² (proportional to A_k² = 2kBT/ω_k²),
+         masked by mode_mask → (d_mode,)
+      7. Linear final + LayerNorm → (d_cond,)
+
+    The 1/ω² weighting encodes the physical fact that low-frequency soft
+    modes have larger thermal amplitudes and dominate the structural signal,
+    especially in the low-q region the model is trying to recover. Plain
+    mean-pooling would dilute these dominant modes with stiff C-H stretches.
+
+    Parameters
+    ----------
+    max_atoms : padded atom count (must match V_vib first dim // 3)
+    d_atom    : hidden dim of per-atom MLP
+    d_mode    : per-mode embedding dim before final projection
+    d_cond    : output conditioning dim (fed to FiLM layers)
+    """
+    def __init__(self, max_atoms: int = 75, d_atom: int = 64,
+                 d_mode: int = 128, d_cond: int = 64):
+        super().__init__()
+        self.max_atoms = max_atoms
+
+        self.atom_mlp = nn.Sequential(
+            nn.Linear(3, d_atom),
+            nn.ReLU(),
+            nn.Linear(d_atom, d_mode),
+        )
+        self.out_proj = nn.Linear(d_mode + 1, d_mode)
+        self.final    = nn.Sequential(
+            nn.Linear(d_mode, d_cond),
+            nn.LayerNorm(d_cond),
+        )
+
+    def forward(self, V_vib: torch.Tensor, omegas: torch.Tensor,
+                atom_mask: torch.Tensor, mode_mask: torch.Tensor) -> torch.Tensor:
+        """
+        V_vib     : (batch, 3*max_atoms, max_modes)
+        omegas    : (batch, max_modes)
+        atom_mask : (batch, max_atoms)  bool — True for real atoms
+        mode_mask : (batch, max_modes)  bool — True for real modes
+
+        Returns   : (batch, d_cond)
+        """
+        batch, _, max_modes = V_vib.shape
+
+        # (batch, max_atoms, 3, max_modes) → (batch, max_modes, max_atoms, 3)
+        x = V_vib.reshape(batch, self.max_atoms, 3, max_modes).permute(0, 3, 1, 2)
+
+        # Per-atom embedding: (batch, max_modes, max_atoms, d_mode)
+        x = self.atom_mlp(x)
+
+        # Masked mean-pool over atoms: (batch, max_modes, d_mode)
+        atom_m = atom_mask.unsqueeze(1).unsqueeze(-1).float()   # (batch, 1, max_atoms, 1)
+        x = (x * atom_m).sum(dim=2) / atom_m.sum(dim=2).clamp(min=1)
+
+        # Concatenate frequency, project: (batch, max_modes, d_mode)
+        x = self.out_proj(torch.cat([x, omegas.unsqueeze(-1)], dim=-1))
+
+        # Thermal-amplitude-weighted pool over modes: weight ∝ 1/ω², masked.
+        # Soft (low-ω) modes have larger A_k = sqrt(2kBT)/ω_k and dominate the
+        # structural signal at low q — give them more weight in the embedding.
+        weight = 1.0 / (omegas.pow(2) + 1e-6)                    # (batch, max_modes)
+        weight = (weight * mode_mask.float()).unsqueeze(-1)      # (batch, max_modes, 1)
+        x = (x * weight).sum(dim=1) / weight.sum(dim=1).clamp(min=1e-6)
+
+        return self.final(x)                                    # (batch, d_cond)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Encoder — q-space signal → R-space representation (FiLM-conditioned)
 # ═════════════════════════════════════════════════════════════════════════════
 
 class BeamstopEncoder(nn.Module):
     """
-    Maps masked ΔS0_norm (nq,) to ΔPD_eff (nR,) via:
-      1. Conv1d feature extraction in q-space   (length nq preserved)
-      2. Linear interpolation from nq to nR     (no learned params)
-      3. Conv1d refinement in R-space           (length nR preserved)
+    Maps masked ΔS0_norm (nq,) to ΔPD_eff (nR,) via FiLM-conditioned CNNs.
 
-    The mask is concatenated as a second input channel so the encoder knows
-    which q values are observed vs. missing.
+    Architecture:
+      [signal, mask] → q-space Conv1d (FiLM) → interpolate to nR
+                     → R-space Conv1d (FiLM) → ΔPD_eff
+
+    The mask channel tells the encoder which q values are observed vs. missing.
+    Last Conv1d in each block is zero-initialized to prevent blow-up at init.
     """
-
-    def __init__(self, nq: int, nR: int, n_channels: int = 32, kernel_size: int = 5):
+    def __init__(self, nq: int, nR: int, n_channels: int = 32,
+                 d_cond: int = 64, kernel_size: int = 5):
         super().__init__()
         self.nR = nR
         pad = kernel_size // 2
 
-        self.q_conv = nn.Sequential(
-            nn.Conv1d(2, n_channels, kernel_size, padding=pad),
-            nn.PReLU(n_channels),
-            nn.Conv1d(n_channels, n_channels, kernel_size, padding=pad),
-            nn.PReLU(n_channels),
-            nn.Conv1d(n_channels, 1, kernel_size, padding=pad),
-        )
+        self.q_conv1 = nn.Conv1d(2,          n_channels, kernel_size, padding=pad)
+        self.q_act1  = nn.PReLU(n_channels)
+        self.q_film1 = FiLM(n_channels, d_cond)
+        self.q_conv2 = nn.Conv1d(n_channels, n_channels, kernel_size, padding=pad)
+        self.q_act2  = nn.PReLU(n_channels)
+        self.q_film2 = FiLM(n_channels, d_cond)
+        self.q_conv3 = nn.Conv1d(n_channels, 1,          kernel_size, padding=pad)
 
-        self.R_conv = nn.Sequential(
-            nn.Conv1d(1, n_channels, kernel_size, padding=pad),
-            nn.PReLU(n_channels),
-            nn.Conv1d(n_channels, n_channels, kernel_size, padding=pad),
-            nn.PReLU(n_channels),
-            nn.Conv1d(n_channels, 1, kernel_size, padding=pad),
-        )
+        self.R_conv1 = nn.Conv1d(1,          n_channels, kernel_size, padding=pad)
+        self.R_act1  = nn.PReLU(n_channels)
+        self.R_film1 = FiLM(n_channels, d_cond)
+        self.R_conv2 = nn.Conv1d(n_channels, n_channels, kernel_size, padding=pad)
+        self.R_act2  = nn.PReLU(n_channels)
+        self.R_film2 = FiLM(n_channels, d_cond)
+        self.R_conv3 = nn.Conv1d(n_channels, 1,          kernel_size, padding=pad)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        nn.init.zeros_(self.q_conv3.weight); nn.init.zeros_(self.q_conv3.bias)
+        nn.init.zeros_(self.R_conv3.weight); nn.init.zeros_(self.R_conv3.bias)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor,
+                mol_cond: torch.Tensor) -> torch.Tensor:
         """
-        x    : (batch, nq)  — ΔS0_norm with q < q_min zeroed
-        mask : (batch, nq)  — 1.0 where observed, 0.0 where masked
-        Returns: (batch, nR)
+        x        : (batch, nq)     — masked ΔS0_norm
+        mask     : (batch, nq)     — 1=observed, 0=masked
+        mol_cond : (batch, d_cond)
+
+        Returns  : (batch, nR)
         """
-        h = torch.stack([x, mask], dim=1)                                          # (batch, 2, nq)
-        h = self.q_conv(h)                                                          # (batch, 1, nq)
-        h = F.interpolate(h, size=self.nR, mode='linear', align_corners=True)      # (batch, 1, nR)
-        h = self.R_conv(h)                                                          # (batch, 1, nR)
-        return h.squeeze(1)                                                         # (batch, nR)
+        h = torch.stack([x, mask], dim=1)
+        h = self.q_film1(self.q_act1(self.q_conv1(h)), mol_cond)
+        h = self.q_film2(self.q_act2(self.q_conv2(h)), mol_cond)
+        h = self.q_conv3(h)
+
+        h = F.interpolate(h, size=self.nR, mode='linear', align_corners=True)
+
+        h = self.R_film1(self.R_act1(self.R_conv1(h)), mol_cond)
+        h = self.R_film2(self.R_act2(self.R_conv2(h)), mol_cond)
+        h = self.R_conv3(h)
+        return h.squeeze(1)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -128,55 +256,101 @@ class BeamstopEncoder(nn.Module):
 
 class BeamstopModel(nn.Module):
     """
-    Predicts the missing low-q region of ΔS0_norm blocked by the beamstop.
+    Predicts the missing low-q region of ΔS0_norm, conditioned on the
+    molecule's normal modes and vibrational frequencies via FiLM.
 
     Parameters
     ----------
     B_sinc     : (nR, nq) sinc/Debye forward operator (from build_sinc_operator)
-    n_channels : hidden channels in encoder CNNs  (default: 32)
-    kernel_size: Conv1d kernel size               (default: 5)
+    max_atoms  : padded atom count in V_vib             (default 75)
+    max_modes  : padded mode count in V_vib / omegas    (default 219)
+    d_atom     : hidden dim in per-atom MLP             (default 64)
+    d_mode     : per-mode embedding dim                 (default 128)
+    d_cond     : FiLM conditioning vector dim           (default 64)
+    n_channels : hidden channels in encoder CNNs        (default 32)
+    kernel_size: Conv1d kernel size                     (default 5)
     """
-
-    def __init__(self, B_sinc: torch.Tensor, n_channels: int = 32, kernel_size: int = 5):
+    def __init__(self, B_sinc: torch.Tensor, max_atoms: int = 75,
+                 max_modes: int = 219, d_atom: int = 64, d_mode: int = 128,
+                 d_cond: int = 64, n_channels: int = 32, kernel_size: int = 5,
+                 use_conditioning: bool = True):
         super().__init__()
-        self.register_buffer('B_sinc', B_sinc.float())  # (nR, nq) — fixed
+        self.register_buffer('B_sinc', B_sinc.float())
+        self.use_conditioning = use_conditioning
         nR, nq = B_sinc.shape
-        self.encoder = BeamstopEncoder(nq, nR, n_channels, kernel_size)
+        self.d_cond    = d_cond
+        self.mol_embed = MolEmbedding(max_atoms, d_atom, d_mode, d_cond) if use_conditioning else None
+        self.encoder   = BeamstopEncoder(nq, nR, n_channels, d_cond, kernel_size)
 
-    def forward(self, delta_S0_masked: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, delta_S0_masked: torch.Tensor, mask: torch.Tensor,
+                V_vib: torch.Tensor | None = None, omegas: torch.Tensor | None = None,
+                atom_mask: torch.Tensor | None = None,
+                mode_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Parameters
         ----------
-        delta_S0_masked : (batch, nq)  — ΔS0_norm with q < q_min set to 0
-        mask            : (batch, nq)  — 1.0 where observed, 0.0 where masked
+        delta_S0_masked : (batch, nq)              — ΔS0_norm with q < q_min = 0
+        mask            : (batch, nq)              — 1=observed, 0=masked
+        V_vib           : (batch, 3*max_atoms, max_modes)  required if use_conditioning
+        omegas          : (batch, max_modes)                required if use_conditioning
+        atom_mask       : (batch, max_atoms)  bool          required if use_conditioning
+        mode_mask       : (batch, max_modes)  bool          required if use_conditioning
 
         Returns
         -------
-        delta_S0_pred : (batch, nq)  — predicted ΔS0_norm at all q
+        delta_S0_pred : (batch, nq)
         """
-        delta_pd = self.encoder(delta_S0_masked, mask)                 # (batch, nR)
+        if self.use_conditioning:
+            mol_cond = self.mol_embed(V_vib, omegas, atom_mask, mode_mask)
+        else:
+            mol_cond = delta_S0_masked.new_zeros(delta_S0_masked.shape[0], self.d_cond)
 
-        # Enforce ΔS0(q=0) = 0: at q=0, B_sinc[:,0] ≈ 2 for all R, so
-        # ΔS0(0) ∝ 2·sum(ΔPD_eff). Zero-centering sets sum=0, hence ΔS0(0)=0.
+        delta_pd = self.encoder(delta_S0_masked, mask, mol_cond)
         delta_pd = delta_pd - delta_pd.mean(dim=-1, keepdim=True)
-
-        return delta_pd @ self.B_sinc                                   # (batch, nq)
+        return delta_pd @ self.B_sinc
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Smoothness loss (imported by training script)
+# Loss
 # ═════════════════════════════════════════════════════════════════════════════
 
-def smoothness_loss(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def masked_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
+                lambda_masked: float = 10.0, lambda_smooth: float = 0.0) -> torch.Tensor:
     """
-    Second-derivative penalty applied only to the predicted (masked) low-q region.
+    Combined loss with masked-region upweighting and optional smoothness.
 
-    x    : (batch, nq)  — predicted ΔS0_norm
-    mask : (batch, nq)  — 1=observed, 0=predicted
+    Masked upweighting  — masked (low-q) MSE normalized per q-point and
+                          multiplied by lambda_masked vs observed region.
+    Smoothness          — second-derivative penalty on the masked region only.
+                          Defaults to 0 because the B_sinc forward operator
+                          already band-limits the output by construction
+                          (sinc transform of a finite R-grid is band-limited
+                          in q); an extra smoothness penalty fights the
+                          legitimate structural oscillations in the masked
+                          region. Enable only if you see instability.
+
+    Parameters
+    ----------
+    pred, target  : (batch, nq)
+    mask          : (batch, nq)  1=observed, 0=masked
+    lambda_masked : upweight factor for masked region (default 10)
+    lambda_smooth : smoothness penalty weight          (default 0)
     """
-    d2          = x[:, 2:] - 2 * x[:, 1:-1] + x[:, :-2]       # (batch, nq-2)
-    pred_region = (mask[:, 1:-1] == 0).float()
-    return (d2.pow(2) * pred_region).sum() / (pred_region.sum() + 1e-8)
+    residual = pred - target
+
+    n_obs  = mask.sum(dim=-1, keepdim=True).clamp(min=1)
+    n_mask = (1 - mask).sum(dim=-1, keepdim=True).clamp(min=1)
+
+    mse_obs  = (residual.pow(2) * mask      / n_obs ).sum(dim=-1).mean()
+    mse_mask = (residual.pow(2) * (1-mask)  / n_mask).sum(dim=-1).mean()
+
+    loss = mse_obs + lambda_masked * mse_mask
+    if lambda_smooth > 0:
+        d2          = pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]
+        pred_region = (mask[:, 1:-1] == 0).float()
+        smooth      = (d2.pow(2) * pred_region).sum() / (pred_region.sum() + 1e-8)
+        loss = loss + lambda_smooth * smooth
+    return loss
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -190,34 +364,50 @@ if __name__ == '__main__':
 
     if npz_files:
         ref  = np.load(npz_files[0])
-        q_np = ref['q']
-        R_np = ref['R_grid']
+        q_np = ref['q'];  R_np = ref['R_grid']
+        omegas_np = ref['omegas_ASE'];  V_vib_np = ref['V_vib']
         print(f'Building B_sinc from {npz_files[0]}')
+        print(f'omegas: {omegas_np.shape}, V_vib: {V_vib_np.shape}')
     else:
-        print('No data found — using synthetic grids')
-        q_np = np.arange(1e-4, 10.1, 0.1, dtype=np.float32)
-        R_np = np.linspace(0.025, 31.4, 1258, dtype=np.float32)
+        print('No data found — using synthetic data')
+        q_np      = np.arange(1e-4, 10.1, 0.1, dtype=np.float32)
+        R_np      = np.linspace(0.025, 31.4, 1257, dtype=np.float32)
+        omegas_np = np.linspace(50, 3500, 30, dtype=np.float32)
+        V_vib_np  = np.random.randn(30, 30).astype(np.float32)
 
+    MAX_ATOMS = 75; MAX_MODES = 219
     B_sinc = build_sinc_operator(q_np, R_np)
-    model  = BeamstopModel(B_sinc, n_channels=32, kernel_size=5)
+    model  = BeamstopModel(B_sinc, max_atoms=MAX_ATOMS, max_modes=MAX_MODES,
+                           n_channels=32)
 
-    nq    = len(q_np)
-    batch = 4
-    dq    = float(q_np[1] - q_np[0])
+    batch     = 4
+    nq        = len(q_np)
+    dq        = float(q_np[1] - q_np[0])
+    q_min_idx = int(0.75 / dq)
 
-    # Simulate beamstop at q_min = 0.75 Å⁻¹ (midpoint of [0.5, 1.0] training range)
-    q_min     = 0.75
-    q_min_idx = int(q_min / dq)
-    mask      = torch.ones(batch, nq)
+    # Build padded inputs
+    n_modes = len(omegas_np);  n_atoms = V_vib_np.shape[0] // 3
+    V_pad   = np.zeros((3 * MAX_ATOMS, MAX_MODES), dtype=np.float32)
+    V_pad[:3*n_atoms, :n_modes] = V_vib_np[:3*n_atoms, :n_modes]
+    om_pad  = np.zeros(MAX_MODES, dtype=np.float32)
+    om_pad[:n_modes] = omegas_np
+
+    V_vib_t   = torch.tensor(V_pad).unsqueeze(0).expand(batch, -1, -1)
+    omegas_t  = torch.tensor(om_pad).unsqueeze(0).expand(batch, -1)
+    atom_mask = torch.zeros(batch, MAX_ATOMS, dtype=torch.bool)
+    atom_mask[:, :n_atoms] = True
+    mode_mask = torch.zeros(batch, MAX_MODES, dtype=torch.bool)
+    mode_mask[:, :n_modes] = True
+
+    mask          = torch.ones(batch, nq)
     mask[:, :q_min_idx] = 0.0
-
-    delta_S0        = torch.randn(batch, nq) * 0.1
+    delta_S0      = torch.randn(batch, nq) * 0.1
     delta_S0_masked = delta_S0 * mask
 
-    pred = model(delta_S0_masked, mask)
+    pred = model(delta_S0_masked, mask, V_vib_t, omegas_t, atom_mask, mode_mask)
+    loss = masked_loss(pred, delta_S0, mask)
 
-    print(f'Input  delta_S0_masked : {tuple(delta_S0_masked.shape)}')
-    print(f'Output delta_S0_pred   : {tuple(pred.shape)}')
-    print(f'pred[:, 0] (q≈0)       : {pred[:, 0].detach().tolist()}  ← should be ~0')
-    print(f'Parameters             : {sum(p.numel() for p in model.parameters()):,}')
-    print(f'B_sinc                 : {tuple(B_sinc.shape)}  ({B_sinc.nbytes / 1e6:.1f} MB)')
+    print(f'pred shape   : {tuple(pred.shape)}')
+    print(f'pred[:,0]    : {pred[:, 0].detach().tolist()}  ← should be ~0')
+    print(f'loss         : {loss.item():.6f}  nan={loss.isnan().item()}')
+    print(f'Parameters   : {sum(p.numel() for p in model.parameters()):,}')

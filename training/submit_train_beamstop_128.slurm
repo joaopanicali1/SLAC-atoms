@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --partition=gpu-turing
+#SBATCH --partition=gpu-volta
 #SBATCH --gres=gpu:1
 #SBATCH --output=/home/research/joaop/SLAC-atoms/training/logs/train_beamstop_128_%j.out
 #SBATCH --error=/home/research/joaop/SLAC-atoms/training/logs/train_beamstop_128_%j.err

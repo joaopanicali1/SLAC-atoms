@@ -66,11 +66,22 @@ class LPDDataset(Dataset):
         self.q      = torch.from_numpy(ref["q"].astype(np.float32))       # (nq,)
         self.R_grid = torch.from_numpy(ref["R_grid"].astype(np.float32))  # (nR,)
 
-        # Build flat index: list of (file_idx, traj_idx, frame_idx)
-        self._index: list[tuple[int, int, int]] = []
+        # Preload all dS0 and pd_true arrays into memory — avoids per-sample
+        # disk reads in __getitem__ which would make each epoch extremely slow.
+        self._index:   list[tuple[int, int, int]] = []
+        self._dS0:     list[np.ndarray] = []   # (n_traj, n_frames, nq) per file
+        self._pd_true: list[np.ndarray] = []   # (n_traj, n_frames, nR) per file
+        self._mol_idx: list[int]        = []
+
         for fi, fpath in enumerate(self.files):
-            data = np.load(fpath)
-            n_traj, n_frames, _ = data["dS0"].shape
+            data    = np.load(fpath)
+            dS0_arr = data["dS0"].astype(np.float32)      # (n_traj, n_frames, nq)
+            pd_arr  = data["pd_true"].astype(np.float32)  # (n_traj, n_frames, nR)
+            self._dS0.append(dS0_arr)
+            self._pd_true.append(pd_arr)
+            self._mol_idx.append(int(data["mol_idx"]))
+
+            n_traj, n_frames, _ = dS0_arr.shape
             for ti in range(n_traj):
                 for fr in range(n_frames):
                     self._index.append((fi, ti, fr))
@@ -80,15 +91,14 @@ class LPDDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         fi, ti, fr = self._index[idx]
-        data = np.load(self.files[fi])
 
-        dS0     = torch.from_numpy(data["dS0"][ti, fr].astype(np.float32))     # (nq,)
-        pd_true = torch.from_numpy(data["pd_true"][ti, fr].astype(np.float32)) # (nR,)
+        dS0     = torch.from_numpy(self._dS0[fi][ti, fr])
+        pd_true = torch.from_numpy(self._pd_true[fi][ti, fr])
 
         return {
             "dS0":      dS0,
             "pd_true":  pd_true,
-            "mol_idx":  int(data["mol_idx"]),
+            "mol_idx":  self._mol_idx[fi],
             "traj_idx": ti,
             "frame_idx": fr,
         }

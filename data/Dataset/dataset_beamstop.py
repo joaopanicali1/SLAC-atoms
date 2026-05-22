@@ -65,12 +65,18 @@ class BeamstopDataset(Dataset):
         data_dir: str | Path,
         q_min_lo: float = 0.5,
         q_min_hi: float = 1.0,
+        max_atoms: int = 75,
+        max_modes: int = 219,
+        use_conditioning: bool = True,
         seed: int | None = None,
     ):
-        self.data_dir = Path(data_dir)
-        self.q_min_lo = q_min_lo
-        self.q_min_hi = q_min_hi
-        self.rng      = np.random.default_rng(seed)
+        self.data_dir        = Path(data_dir)
+        self.q_min_lo        = q_min_lo
+        self.q_min_hi        = q_min_hi
+        self.max_atoms       = max_atoms
+        self.max_modes       = max_modes
+        self.use_conditioning = use_conditioning
+        self.rng             = np.random.default_rng(seed)
 
         self.files = sorted(self.data_dir.glob("mol_*_pd.npz"))
         if not self.files:
@@ -85,23 +91,44 @@ class BeamstopDataset(Dataset):
         # Build flat (file, traj, frame) index and precompute ΔS0_norm per file.
         # Reference for trajectory ti is its own first frame S0[ti, 0].
         # Frame 0 is excluded — ΔS0[ti, 0] = 0 trivially, nothing to learn.
-        self._index: list[tuple[int, int, int]] = []
-        self._delta_S0: list[np.ndarray] = []   # one (n_traj, n_frames, nq) per file
+        self._index:     list[tuple[int, int, int]] = []
+        self._delta_S0:  list[np.ndarray] = []  # (n_traj, n_frames, nq) per file
+        # Mode data only loaded when use_conditioning=True to keep per-batch
+        # payload small and avoid crashing the pin_memory IPC thread.
+        self._V_vib:     list[np.ndarray] = []
+        self._omegas:    list[np.ndarray] = []
+        self._atom_mask: list[np.ndarray] = []
+        self._mode_mask: list[np.ndarray] = []
 
         for fi, fpath in enumerate(self.files):
             data = np.load(fpath)
             S0   = data["S0"].astype(np.float32)   # (n_traj, n_frames, nq)
             fe   = data["fe"].astype(np.float32)   # (nq,)
 
-            # Per-trajectory reference: first frame of each trajectory.
-            S0_ref = S0[:, 0:1, :]                 # (n_traj, 1, nq)
+            S0_ref = S0[:, 0:1, :]
+            self._delta_S0.append((S0 - S0_ref) / (fe[None, None, :] + 1e-12))
 
-            delta_S0_norm = (S0 - S0_ref) / (fe[None, None, :] + 1e-12)
-            self._delta_S0.append(delta_S0_norm)   # (n_traj, n_frames, nq)
+            if use_conditioning:
+                V_raw  = data["V_vib"].astype(np.float32)
+                om_raw = data["omegas_ASE"].astype(np.float32)
+                three_N, n_modes = V_raw.shape
+                n_atoms = three_N // 3
+
+                V_pad = np.zeros((3 * max_atoms, max_modes), dtype=np.float32)
+                V_pad[:three_N, :n_modes] = V_raw
+                om_pad = np.zeros(max_modes, dtype=np.float32)
+                om_pad[:n_modes] = om_raw
+                atom_mask = np.zeros(max_atoms, dtype=bool); atom_mask[:n_atoms] = True
+                mode_mask = np.zeros(max_modes, dtype=bool); mode_mask[:n_modes] = True
+
+                self._V_vib.append(V_pad)
+                self._omegas.append(om_pad)
+                self._atom_mask.append(atom_mask)
+                self._mode_mask.append(mode_mask)
 
             n_traj, n_frames, _ = S0.shape
             for ti in range(n_traj):
-                for fr in range(1, n_frames):      # skip fr=0 (trivially zero)
+                for fr in range(1, n_frames):
                     self._index.append((fi, ti, fr))
 
     def __len__(self) -> int:
@@ -123,11 +150,17 @@ class BeamstopDataset(Dataset):
 
         delta_S0_masked = delta_S0_norm * mask
 
-        return {
-            "delta_S0_masked": delta_S0_masked,   # (nq,) — model input
-            "delta_S0_norm":   delta_S0_norm,      # (nq,) — target
-            "mask":            mask,               # (nq,) — 1=observed, 0=missing
+        sample = {
+            "delta_S0_masked": delta_S0_masked,
+            "delta_S0_norm":   delta_S0_norm,
+            "mask":            mask,
             "mol_idx":         fi,
             "traj_idx":        ti,
             "frame_idx":       fr,
         }
+        if self.use_conditioning:
+            sample["V_vib"]     = torch.from_numpy(self._V_vib[fi])
+            sample["omegas"]    = torch.from_numpy(self._omegas[fi])
+            sample["atom_mask"] = torch.from_numpy(self._atom_mask[fi])
+            sample["mode_mask"] = torch.from_numpy(self._mode_mask[fi])
+        return sample

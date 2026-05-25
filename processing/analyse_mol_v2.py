@@ -57,7 +57,6 @@ def build_scattering_context(
         * f0[:, all_pairs[:, 1]]
     )
 
-    fe = np.sum(fafb, axis=1)
     self_scatter = np.sum(f0**2, axis=1)
 
     Z = np.array([
@@ -65,16 +64,24 @@ def build_scattering_context(
         for el in atom_names
     ])
 
-    pair_weights = (
-        Z[all_pairs[:, 0]]
-        * Z[all_pairs[:, 1]]
-    )
+    pair_weights = (Z[all_pairs[:, 0]] * Z[all_pairs[:, 1]])
+
+    Z_sum = np.sum(Z)
+
+    # average normalized form factor
+    f_hat = np.sum(f0, axis=1) / Z_sum
+
+    # total z-weight of all pairs
+    sum_Z_pairs = np.sum(pair_weights)
+
+    # sharpened effective form factor
+    fe_sharpened = sum_Z_pairs * (f_hat ** 2)
 
     return {
         "f0": f0,
         "all_pairs": all_pairs,
         "fafb": fafb,
-        "fe": fe,
+        "fe": fe_sharpened,
         "self_scatter": self_scatter,
         "pair_weights": pair_weights,
     }

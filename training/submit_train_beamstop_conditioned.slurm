@@ -22,4 +22,5 @@ python -u training/train_beamstop.py \
     --use-conditioning \
     --lambda-masked 10.0 \
     --no-pin-memory \
+    --num-workers 0 \
     --checkpoint-dir checkpoints/beamstop_conditioned

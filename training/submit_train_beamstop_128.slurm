@@ -19,4 +19,10 @@ mkdir -p training/logs checkpoints/beamstop_128
 PYTHONPATH=/home/research/joaop/SLAC-atoms \
 python -u training/train_beamstop.py \
     --n-channels 128 \
+    --batch-size 128 \
+    --lr 2e-3 \
+    --lambda-smooth 0 \
+    --lambda-boundary 1.0 \
+    --lambda-pd 1e-3 \
+    --R-cap 10.0 \
     --checkpoint-dir checkpoints/beamstop_128

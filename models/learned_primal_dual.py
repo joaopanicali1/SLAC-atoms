@@ -117,17 +117,25 @@ def _dbt(n: int, data: np.ndarray, q: np.ndarray, M: int) -> tuple[np.ndarray, n
 # DBT operator matrix  (precomputed once, used as fixed buffers in the model)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def build_dbt_operator(q: np.ndarray, M: int, verbose: bool = True):
+def build_dbt_operator(q: np.ndarray, M: int, normalize: bool = True,
+                       verbose: bool = True):
     """
     Build the DBT operator as a dense matrix A_dbt of shape (nR, nq).
 
     A_dbt[:, j] = _dbt(e_j, q, M)  where e_j is the j-th standard basis vector.
 
+    If normalize=True (default), divide A_dbt by its spectral norm so that
+    ‖T‖ = ‖T*‖ = 1. This is essential for stability in unrolled iterative
+    schemes (Adler & Öktem 2018): a perturbation δ in iteration k propagates
+    as δ·‖A‖^k through the loop, so anything ‖A‖ > 1 causes exponential
+    blowup over n_iter steps.
+
     Parameters
     ----------
-    q : (nq,) array of q values in Å⁻¹
-    M : DBT order — controls the R-space grid density.
-        Typically M = ceil(π / (dR · dq)) + 1, matching analyse_mol_v2.py.
+    q         : (nq,) array of q values in Å⁻¹
+    M         : DBT order — controls R-space grid density.
+                Typically M = ceil(π / (dR · dq)) + 1.
+    normalize : if True, scale A by 1/σ_max so spectral norm = 1.
 
     Returns
     -------
@@ -144,9 +152,14 @@ def build_dbt_operator(q: np.ndarray, M: int, verbose: bool = True):
         e_j = np.zeros(nq); e_j[j] = 1.0
         A[:, j], _ = _dbt(0, e_j, q, M)
 
+    sigma_max = float(np.linalg.norm(A, ord=2))
+    if normalize:
+        A = A / sigma_max
+
     if verbose:
-        print(f'A_dbt  : {A.shape}  ({A.nbytes / 1e6:.1f} MB)')
-        print(f'Rgrid  : [{Rgrid_np[0]:.3f}, {Rgrid_np[-1]:.2f}] Å  ({nR} pts)')
+        print(f'A_dbt      : {A.shape}  ({A.nbytes / 1e6:.1f} MB)')
+        print(f'Rgrid      : [{Rgrid_np[0]:.3f}, {Rgrid_np[-1]:.2f}] Å  ({nR} pts)')
+        print(f'σ_max(A)   : {sigma_max:.4f}  ({"normalized to 1" if normalize else "kept as-is"})')
 
     return torch.tensor(A, dtype=torch.float32), \
            torch.tensor(Rgrid_np, dtype=torch.float32)

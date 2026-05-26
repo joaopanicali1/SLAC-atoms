@@ -30,10 +30,32 @@ Usage
     # sample['pd_true'] : (nR,)
 """
 
+import time
+import zipfile
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 import numpy as np
+
+
+def _load_npz_with_retry(fpath, keys=("dS0", "pd_true"), max_retries=4, backoff=1.0):
+    """
+    np.load an npz file and force-read the listed arrays, with retry on
+    transient I/O errors (BadZipFile, OSError). HPC parallel filesystems
+    under concurrent load from multiple jobs can return CRC errors on
+    individual reads; retrying typically succeeds.
+    """
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            d = np.load(fpath)
+            arrays = {k: np.asarray(d[k]) for k in keys}   # force full read of each array
+            return arrays
+        except (zipfile.BadZipFile, OSError) as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                time.sleep(backoff * (attempt + 1))
+    raise RuntimeError(f"Failed to load {fpath} after {max_retries} retries: {last_err}")
 
 
 class LPDDataset(Dataset):
@@ -73,18 +95,30 @@ class LPDDataset(Dataset):
         self._pd_true: list[np.ndarray] = []   # (n_traj, n_frames, nR) per file
         self._mol_idx: list[int]        = []
 
-        for fi, fpath in enumerate(self.files):
-            data    = np.load(fpath)
-            dS0_arr = data["dS0"].astype(np.float32)      # (n_traj, n_frames, nq)
-            pd_arr  = data["pd_true"].astype(np.float32)  # (n_traj, n_frames, nR)
+        n_skipped  = 0
+        loaded_idx = 0   # index into _dS0/_pd_true (differs from fi when files are skipped)
+        for fpath in self.files:
+            try:
+                arrays = _load_npz_with_retry(fpath, keys=("dS0", "pd_true", "mol_idx"))
+            except RuntimeError as e:
+                print(f"  WARNING: skipping {fpath.name} — {e}")
+                n_skipped += 1
+                continue
+
+            dS0_arr = arrays["dS0"].astype(np.float32)
+            pd_arr  = arrays["pd_true"].astype(np.float32)
             self._dS0.append(dS0_arr)
             self._pd_true.append(pd_arr)
-            self._mol_idx.append(int(data["mol_idx"]))
+            self._mol_idx.append(int(arrays["mol_idx"]))
 
             n_traj, n_frames, _ = dS0_arr.shape
             for ti in range(n_traj):
                 for fr in range(n_frames):
-                    self._index.append((fi, ti, fr))
+                    self._index.append((loaded_idx, ti, fr))
+            loaded_idx += 1
+
+        if n_skipped:
+            print(f"  {n_skipped} file(s) skipped due to read errors.")
 
     def __len__(self) -> int:
         return len(self._index)

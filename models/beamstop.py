@@ -11,7 +11,8 @@ trajectory, analogous to the pre-pump ground-state measurement in TRXSS.
 Physics constraints enforced by construction:
   1. ΔS0_norm(q=0) = 0  — because S0(q=0) = (ΣZ_i)² is geometry-independent,
                            enforced by zero-centering the R-space intermediate
-  2. Smoothness            — enforced via second-derivative loss penalty
+  2. Smoothness            — enforced architecturally via R-cap band-limiting
+                             (R_max controls fastest q-space oscillation period)
 
 Architecture (physics-guided encoder-decoder with mode-embedding FiLM conditioning):
   MolEmbedding : V_vib + omegas + masks → mol_cond (d_cond,)
@@ -21,7 +22,16 @@ Architecture (physics-guided encoder-decoder with mode-embedding FiLM conditioni
                    → interpolate to nR
                    → Conv1d in R-space, FiLM-conditioned on mol_cond
                    → ΔPD_eff (batch, nR)
-  Decoder      : zero-center(ΔPD_eff) @ B_sinc → ΔS0_norm_pred (batch, nq)  [fixed]
+  Decoder      : Differentiable Debye sum (mirrors simulate_scattering):
+                   zero-center(ΔPD_eff) → Σ_m ΔPD[m] · 2·j₀(q·R[m])
+                   → ΔS0_norm_pred (batch, nq)
+
+                 This is identical in structure to simulate_scattering's:
+                   bessel = sinc(q·r_ab / π)
+                   ΔS0 = 2 · Σ_pairs(fafb · bessel)
+                 but applied to the continuous R-grid pair density rather than
+                 discrete atom pairs (uniform form-factor weights, since ΔS0 is
+                 already normalized by fe).
 
 FiLM (Feature-wise Linear Modulation) applies per-channel scale γ and shift β
 derived from mol_cond after each activation: out = γ(mol_cond) * act + β(mol_cond).
@@ -33,12 +43,12 @@ Loss (masked_loss):
 
 Usage
 -----
-    from models.beamstop import BeamstopModel, build_sinc_operator
-    B_sinc = build_sinc_operator(q_np, R_grid_np)
-    model  = BeamstopModel(B_sinc, max_atoms=75, max_modes=219)
-    pred   = model(delta_S0_masked, mask, V_vib, omegas, atom_mask, mode_mask)
+    from models.beamstop import BeamstopModel
+    model = BeamstopModel(q_tensor, R_grid_tensor, max_atoms=75, max_modes=219)
+    pred  = model(delta_S0_masked, mask, V_vib, omegas, atom_mask, mode_mask)
 """
 
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -46,17 +56,27 @@ import torch.nn.functional as F
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Sinc / Debye forward operator  (no Lorch window)
+# Sinc / Debye forward operator
 # ═════════════════════════════════════════════════════════════════════════════
 
 def build_sinc_operator(q: np.ndarray, R_grid: np.ndarray, verbose: bool = True) -> torch.Tensor:
     """
-    Build the plain sinc/Debye forward operator B_sinc of shape (nR, nq).
+    Build the sinc/Debye forward operator B_sinc of shape (nR, nq).
 
-    B_sinc[j, i] = 2 · sin(q[i] · R[j]) / (q[i] · R[j])
+    B_sinc[m, i] = 2 · sin(q[i] · R[m]) / (q[i] · R[m]) = 2 · j₀(q[i] · R[m])
 
-    At q ≈ 0: B_sinc[:, 0] → 2 for all R, so zero-centering ΔPD_eff before
-    projecting guarantees ΔS0_norm(q=0) = 0.
+    This is identical in structure to simulate_scattering's Debye sum:
+        bessel = sinc(q * r_ab / π) = j₀(q * r_ab)
+        ΔS0 = 2 · Σ_pairs fafb · bessel
+    with R_grid bins playing the role of pair distances (uniform fafb weights
+    because ΔS0_norm is already normalized by fe).
+
+    Pre-building the matrix is more efficient than recomputing sinc on every
+    forward pass — the (nR, nq) matrix is computed once and reused as a buffer.
+
+    At q ≈ 0: B_sinc[:, 0] → 2 for all R. Zero-centering ΔPD before projecting
+    guarantees ΔS0_norm(q=0) = 0 by construction (Σ_m delta_pd[m] = 0 →
+    Σ_m delta_pd[m] · 2·j₀(0) = 0).
 
     Parameters
     ----------
@@ -259,9 +279,17 @@ class BeamstopModel(nn.Module):
     Predicts the missing low-q region of ΔS0_norm, conditioned on the
     molecule's normal modes and vibrational frequencies via FiLM.
 
+    The decoder is a pre-built Debye/sinc operator (B_sinc) stored as a buffer.
+    Pre-building is more efficient than recomputing sinc every forward pass.
+
+    forward() returns a tuple (pred, delta_pd):
+      pred     : (batch, nq) — full predicted ΔS0_norm
+      delta_pd : (batch, nR) — R-space intermediate (zero-centred)
+                               used for Tikhonov regularisation in training.
+
     Parameters
     ----------
-    B_sinc     : (nR, nq) sinc/Debye forward operator (from build_sinc_operator)
+    B_sinc     : (nR, nq) sinc/Debye operator  (from build_sinc_operator)
     max_atoms  : padded atom count in V_vib             (default 75)
     max_modes  : padded mode count in V_vib / omegas    (default 219)
     d_atom     : hidden dim in per-atom MLP             (default 64)
@@ -285,7 +313,8 @@ class BeamstopModel(nn.Module):
     def forward(self, delta_S0_masked: torch.Tensor, mask: torch.Tensor,
                 V_vib: torch.Tensor | None = None, omegas: torch.Tensor | None = None,
                 atom_mask: torch.Tensor | None = None,
-                mode_mask: torch.Tensor | None = None) -> torch.Tensor:
+                mode_mask: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
         ----------
@@ -298,7 +327,9 @@ class BeamstopModel(nn.Module):
 
         Returns
         -------
-        delta_S0_pred : (batch, nq)
+        pred     : (batch, nq) — full ΔS0_norm prediction
+        delta_pd : (batch, nR) — zero-centred R-space intermediate,
+                                 exposed for Tikhonov regularisation
         """
         if self.use_conditioning:
             mol_cond = self.mol_embed(V_vib, omegas, atom_mask, mode_mask)
@@ -306,8 +337,16 @@ class BeamstopModel(nn.Module):
             mol_cond = delta_S0_masked.new_zeros(delta_S0_masked.shape[0], self.d_cond)
 
         delta_pd = self.encoder(delta_S0_masked, mask, mol_cond)
+        # Zero-centre so ΔS0_norm(q=0) = 0:
+        # B_sinc[:, q=0] = 2 for all R  →  Σ_m delta_pd[m]·2 = 0 when mean=0.
         delta_pd = delta_pd - delta_pd.mean(dim=-1, keepdim=True)
-        return delta_pd @ self.B_sinc
+
+        pred_raw = delta_pd @ self.B_sinc   # (batch, nq)
+
+        # Hard-constrain the observed region to the measured input. The model
+        # only fills the masked gap; observed q's pass through unchanged.
+        pred = mask * delta_S0_masked + (1.0 - mask) * pred_raw
+        return pred, delta_pd
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -321,13 +360,14 @@ def masked_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
 
     Masked upweighting  — masked (low-q) MSE normalized per q-point and
                           multiplied by lambda_masked vs observed region.
-    Smoothness          — second-derivative penalty on the masked region only.
-                          Defaults to 0 because the B_sinc forward operator
-                          already band-limits the output by construction
-                          (sinc transform of a finite R-grid is band-limited
-                          in q); an extra smoothness penalty fights the
-                          legitimate structural oscillations in the masked
-                          region. Enable only if you see instability.
+    Smoothness          — second-derivative penalty over the full q range.
+                          BeamstopModel.forward hard-pastes observed values
+                          into the output, so smoothness in the observed
+                          region is a constant w.r.t. parameters (no gradient
+                          there). The gradient signal lands on the masked
+                          region and on the boundary between the two —
+                          enforcing both intra-gap smoothness and continuity
+                          with the measurement at q = q_min.
 
     Parameters
     ----------
@@ -346,11 +386,66 @@ def masked_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
 
     loss = mse_obs + lambda_masked * mse_mask
     if lambda_smooth > 0:
-        d2          = pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]
-        pred_region = (mask[:, 1:-1] == 0).float()
-        smooth      = (d2.pow(2) * pred_region).sum() / (pred_region.sum() + 1e-8)
-        loss = loss + lambda_smooth * smooth
+        d2     = pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]
+        smooth = d2.pow(2).mean()
+        loss   = loss + lambda_smooth * smooth
     return loss
+
+
+def boundary_continuity_loss(pred: torch.Tensor, target: torch.Tensor,
+                             mask: torch.Tensor) -> torch.Tensor:
+    """
+    Slope + curvature continuity at q_min via finite differences.
+
+    BeamstopModel.forward hard-pastes target values into the observed region,
+    so value continuity at q_min is already exact. This loss penalizes
+    mismatch in the FIRST and SECOND derivative across the gap-edge by
+    constraining the two predicted pixels just below q_min to match a
+    quadratic Taylor extrapolation of the measured signal from above.
+
+    Per-sample derivation (with t = target, p = pred, qmi = q_min_idx, dq = grid spacing):
+      slope (meas, fwd FD) = (t[qmi+1] - t[qmi]) / dq
+      slope (ext,  bwd FD) = (p[qmi]   - p[qmi-1]) / dq
+                           = (t[qmi]   - p[qmi-1]) / dq   (paste makes p[qmi]=t[qmi])
+
+      curv  (meas, fwd FD) = (t[qmi+2] - 2 t[qmi+1] + t[qmi]) / dq²
+      curv  (ext,  bwd FD) = (p[qmi]   - 2 p[qmi-1] + p[qmi-2]) / dq²
+
+    Setting ext = meas and solving for the two unknown pixels gives:
+      p[qmi-1] = 2 t[qmi] -   t[qmi+1]
+      p[qmi-2] = 4 t[qmi] - 4 t[qmi+1] + t[qmi+2]
+
+    The dq factors cancel out so the result is a unit-free MSE on the two
+    boundary pixels.
+
+    Parameters
+    ----------
+    pred, target : (batch, nq)
+    mask         : (batch, nq)  1=observed, 0=masked
+
+    Returns
+    -------
+    scalar loss. Zero if no sample has ≥2 masked + ≥3 observed pixels at the
+    boundary (rare; only edge-case masks).
+    """
+    qmi   = mask.argmax(dim=-1)                          # (B,) first obs index
+    B, nq = pred.shape
+    valid = (qmi >= 2) & (qmi + 2 < nq)
+    if not valid.any():
+        return pred.new_zeros(())
+
+    b   = torch.arange(B, device=pred.device)[valid]
+    qmi = qmi[valid]
+
+    t0 = target[b, qmi]
+    t1 = target[b, qmi + 1]
+    t2 = target[b, qmi + 2]
+
+    desired_m1 = 2.0 * t0 -       t1
+    desired_m2 = 4.0 * t0 - 4.0 * t1 + t2
+
+    return ((pred[b, qmi - 1] - desired_m1).pow(2)
+          + (pred[b, qmi - 2] - desired_m2).pow(2)).mean()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -404,7 +499,7 @@ if __name__ == '__main__':
     delta_S0      = torch.randn(batch, nq) * 0.1
     delta_S0_masked = delta_S0 * mask
 
-    pred = model(delta_S0_masked, mask, V_vib_t, omegas_t, atom_mask, mode_mask)
+    pred, delta_pd = model(delta_S0_masked, mask, V_vib_t, omegas_t, atom_mask, mode_mask)
     loss = masked_loss(pred, delta_S0, mask)
 
     print(f'pred shape   : {tuple(pred.shape)}')

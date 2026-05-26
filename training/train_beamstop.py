@@ -9,7 +9,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from data.Dataset.dataset_beamstop import BeamstopDataset
-from models.beamstop import BeamstopModel, build_sinc_operator, masked_loss
+from models.beamstop import BeamstopModel, build_sinc_operator, masked_loss, boundary_continuity_loss
 
 
 def compute_dataset_R_max(data_dir, margin=1.2):
@@ -52,7 +52,8 @@ def warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps):
 
 
 def run_epoch(model, loader, optimizer, scheduler, device,
-              use_conditioning, lambda_masked, lambda_smooth, train=True):
+              use_conditioning, lambda_masked, lambda_smooth, lambda_boundary,
+              lambda_pd, train=True):
     model.train() if train else model.eval()
 
     total_loss = 0.0
@@ -67,7 +68,7 @@ def run_epoch(model, loader, optimizer, scheduler, device,
             mask            = batch["mask"].to(device)
 
             if use_conditioning:
-                pred = model(
+                pred, delta_pd = model(
                     delta_S0_masked, mask,
                     batch["V_vib"].to(device),
                     batch["omegas"].to(device),
@@ -75,11 +76,20 @@ def run_epoch(model, loader, optimizer, scheduler, device,
                     batch["mode_mask"].to(device),
                 )
             else:
-                pred = model(delta_S0_masked, mask)
+                pred, delta_pd = model(delta_S0_masked, mask)
 
             loss = masked_loss(pred, delta_S0_norm, mask,
                                lambda_masked=lambda_masked,
                                lambda_smooth=lambda_smooth)
+            if lambda_boundary > 0:
+                loss = loss + lambda_boundary * boundary_continuity_loss(
+                    pred, delta_S0_norm, mask)
+            if lambda_pd > 0:
+                # Tikhonov regularisation on the R-space intermediate.
+                # Penalises large pair-density coefficients, which suppresses
+                # high-R (fast q-space oscillating) modes — the same mechanism
+                # that makes NSK outputs smooth.
+                loss = loss + lambda_pd * delta_pd.pow(2).mean()
 
             if train:
                 optimizer.zero_grad()
@@ -105,6 +115,8 @@ def train(
     use_conditioning=True,
     lambda_masked=10.0,
     lambda_smooth=1e-3,
+    lambda_boundary=0.0,
+    lambda_pd=0.0,
     checkpoint_dir="checkpoints/beamstop",
     device=None,
 ):
@@ -115,6 +127,8 @@ def train(
     print(f"use_conditioning : {use_conditioning}")
     print(f"lambda_masked    : {lambda_masked}")
     print(f"lambda_smooth    : {lambda_smooth}")
+    print(f"lambda_boundary  : {lambda_boundary}")
+    print(f"lambda_pd        : {lambda_pd}")
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs("logs", exist_ok=True)
@@ -136,13 +150,16 @@ def train(
 
     scheduler = warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps)
 
-    best_val_loss = float("inf")
+    best_val_loss    = float("inf")
+    epochs_no_improve = 0
 
     for epoch in range(1, n_epochs + 1):
         train_loss = run_epoch(model, train_loader, optimizer, scheduler, device,
-                               use_conditioning, lambda_masked, lambda_smooth, train=True)
+                               use_conditioning, lambda_masked, lambda_smooth,
+                               lambda_boundary, lambda_pd, train=True)
         val_loss   = run_epoch(model, val_loader,   optimizer, scheduler, device,
-                               use_conditioning, lambda_masked, lambda_smooth, train=False)
+                               use_conditioning, lambda_masked, lambda_smooth,
+                               lambda_boundary, lambda_pd, train=False)
 
         curr_lr = scheduler.get_last_lr()[0]
 
@@ -154,7 +171,8 @@ def train(
         )
 
         if val_loss < best_val_loss:
-            best_val_loss = val_loss
+            best_val_loss     = val_loss
+            epochs_no_improve = 0
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
@@ -162,6 +180,13 @@ def train(
                 "val_loss": val_loss,
             }, os.path.join(checkpoint_dir, "best_model.pt"))
             print(f"  New best model saved (val loss = {val_loss:.6f})")
+        else:
+            epochs_no_improve += 1
+            print(f"  No improvement for {epochs_no_improve}/5 epochs")
+            if epochs_no_improve >= 5:
+                print(f"Early stopping triggered — val loss has not improved "
+                      f"for 5 consecutive epochs. Best: {best_val_loss:.6f}")
+                break
 
         torch.save({
             "epoch": epoch,
@@ -185,7 +210,13 @@ if __name__ == "__main__":
     parser.add_argument("--lambda-masked",    type=float, default=10.0,                    help="Upweight factor for masked (low-q) loss region")
     parser.add_argument("--lambda-smooth",    type=float, default=0.0,                     help="Smoothness penalty weight (default 0; B_sinc is band-limited by construction)")
     parser.add_argument("--R-margin",         type=float, default=1.2,                     help="Multiplicative margin on max interatomic distance for R-grid truncation")
+    parser.add_argument("--R-cap",            type=float, default=10.0,                    help="Hard cap on R_max (Å); architectural band-limit — smaller cap = smoother low-q output")
+    parser.add_argument("--lambda-boundary",  type=float, default=0.0,                     help="Weight on slope+curvature continuity at q_min (0 = off)")
+    parser.add_argument("--lambda-pd",        type=float, default=0.0,                     help="Tikhonov weight on R-space intermediate delta_pd (suppresses high-R fast-oscillating modes; try 1e-3)")
     parser.add_argument("--no-pin-memory",    action="store_true", default=False,           help="Disable pin_memory in DataLoader (use on nodes where IPC is unreliable)")
+    parser.add_argument("--num-workers",      type=int,   default=4,                        help="DataLoader worker processes (0 disables IPC entirely — needed for large-tensor batches on some nodes)")
+    parser.add_argument("--batch-size",       type=int,   default=32,                       help="Batch size for both loaders")
+    parser.add_argument("--lr",               type=float, default=1e-3,                     help="Peak learning rate after warmup")
     args = parser.parse_args()
 
     data_dir = "data/trajectory_data_cap200"
@@ -198,10 +229,12 @@ if __name__ == "__main__":
     # Build data-driven R-grid: truncate to ~1.2× max interatomic distance.
     # Removes excess R-space DoF that can only fit low-q noise.
     print("Scanning dataset for max interatomic distance ...")
-    R_max = compute_dataset_R_max(data_dir, margin=args.R_margin)
-    dR    = float(dataset.R_grid[1] - dataset.R_grid[0])
+    R_max_data = compute_dataset_R_max(data_dir, margin=args.R_margin)
+    R_max      = min(R_max_data, args.R_cap)
+    dR         = float(dataset.R_grid[1] - dataset.R_grid[0])
     R_grid_truncated = build_truncated_R_grid(R_max, dR=dR)
-    print(f"R_max (margin={args.R_margin}): {R_max:.2f} Å  |  R-grid: {len(R_grid_truncated)} pts (was {len(dataset.R_grid)})")
+    print(f"R_max_data (margin={args.R_margin}): {R_max_data:.2f} Å  |  R_cap: {args.R_cap:.2f} Å  |  "
+          f"R_max used: {R_max:.2f} Å  |  R-grid: {len(R_grid_truncated)} pts (was {len(dataset.R_grid)})")
 
     q_np = dataset.q.numpy()
     print("Building B_sinc ...")
@@ -224,26 +257,32 @@ if __name__ == "__main__":
 
     print(f"Train samples: {len(train_idx):,}  |  Val samples: {len(val_idx):,}")
 
-    pin_memory = not args.no_pin_memory
+    pin_memory  = not args.no_pin_memory
+    num_workers = args.num_workers
     print(f"pin_memory       : {pin_memory}")
+    print(f"num_workers      : {num_workers}")
 
     train_loader = DataLoader(
         Subset(dataset, train_idx),
-        batch_size=32,
+        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         Subset(dataset, val_idx),
-        batch_size=32,
+        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=num_workers,
         pin_memory=pin_memory,
     )
 
-    train(train_loader=train_loader, val_loader=val_loader, B_sinc=B_sinc,
+    train(train_loader=train_loader, val_loader=val_loader,
+          B_sinc=B_sinc,
           n_channels=args.n_channels, checkpoint_dir=args.checkpoint_dir,
           use_conditioning=args.use_conditioning,
           lambda_masked=args.lambda_masked,
-          lambda_smooth=args.lambda_smooth)
+          lambda_smooth=args.lambda_smooth,
+          lambda_boundary=args.lambda_boundary,
+          lambda_pd=args.lambda_pd,
+          lr=args.lr)

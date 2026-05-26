@@ -23,11 +23,13 @@ def warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps):
     return LambdaLR(optimizer, lr_lambda)
 
 
-def run_epoch(model, loader, optimizer, scheduler, device, train=True):
+def run_epoch(model, loader, optimizer, scheduler, device, train=True,
+              grad_clip=0.5):
     model.train() if train else model.eval()
 
     total_loss = 0.0
-    n_batches = 0
+    n_batches  = 0
+    n_skipped  = 0
 
     context = torch.enable_grad() if train else torch.no_grad()
 
@@ -43,16 +45,36 @@ def run_epoch(model, loader, optimizer, scheduler, device, train=True):
             loss = nn.functional.mse_loss(pred / PD_SCALE, pd_true / PD_SCALE)
 
             if train:
+                # Skip the optimizer step on NaN/Inf loss instead of letting one
+                # bad batch corrupt the weights. With 10 unrolled iterations a
+                # single outlier can produce huge gradients; if we step on them,
+                # weights → NaN and every subsequent batch is poisoned.
+                if not torch.isfinite(loss):
+                    optimizer.zero_grad()
+                    n_skipped += 1
+                    scheduler.step()
+                    continue
+
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                grad_norm = nn.utils.clip_grad_norm_(model.parameters(),
+                                                     max_norm=grad_clip)
+                if not torch.isfinite(grad_norm):
+                    optimizer.zero_grad()
+                    n_skipped += 1
+                    scheduler.step()
+                    continue
+
                 optimizer.step()
                 scheduler.step()
 
             total_loss += loss.item()
-            n_batches += 1
+            n_batches  += 1
 
-    return total_loss / n_batches
+    if train and n_skipped:
+        print(f"  WARN: skipped {n_skipped} batches due to NaN/Inf loss or gradient")
+    return total_loss / max(1, n_batches)
 
 
 def train(
@@ -60,8 +82,9 @@ def train(
     val_loader,
     A_dbt,
     n_epochs=100,
-    lr=1e-3,
+    lr=5e-4,
     n_warmup_epochs=5,
+    grad_clip=0.5,
     checkpoint_dir="checkpoints/lpd",
     device=None,
 ):
@@ -69,6 +92,7 @@ def train(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Training on {device}")
+    print(f"lr={lr}  grad_clip={grad_clip}  PD_SCALE={PD_SCALE}")
 
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs("logs", exist_ok=True)
@@ -97,8 +121,10 @@ def train(
     best_val_loss = float("inf")
 
     for epoch in range(1, n_epochs + 1):
-        train_loss = run_epoch(model, train_loader, optimizer, scheduler, device, train=True)
-        val_loss   = run_epoch(model, val_loader,   optimizer, scheduler, device, train=False)
+        train_loss = run_epoch(model, train_loader, optimizer, scheduler, device,
+                               train=True,  grad_clip=grad_clip)
+        val_loss   = run_epoch(model, val_loader,   optimizer, scheduler, device,
+                               train=False, grad_clip=grad_clip)
 
         curr_lr = scheduler.get_last_lr()[0]
 

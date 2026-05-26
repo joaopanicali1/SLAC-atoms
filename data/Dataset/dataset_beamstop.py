@@ -37,10 +37,26 @@ Usage
     # sample['mask']            : (nq,)  — 1=observed, 0=masked
 """
 
+import time
+import zipfile
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 import numpy as np
+
+
+def _load_npz_with_retry(fpath, keys, max_retries=4, backoff=1.0):
+    """Force-read selected arrays from an npz with retry on transient I/O errors."""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            d = np.load(fpath)
+            return {k: np.asarray(d[k]) for k in keys}
+        except (zipfile.BadZipFile, OSError) as e:
+            last_err = e
+            if attempt < max_retries - 1:
+                time.sleep(backoff * (attempt + 1))
+    raise RuntimeError(f"Failed to load {fpath} after {max_retries} retries: {last_err}")
 
 
 class BeamstopDataset(Dataset):
@@ -100,17 +116,28 @@ class BeamstopDataset(Dataset):
         self._atom_mask: list[np.ndarray] = []
         self._mode_mask: list[np.ndarray] = []
 
-        for fi, fpath in enumerate(self.files):
-            data = np.load(fpath)
-            S0   = data["S0"].astype(np.float32)   # (n_traj, n_frames, nq)
-            fe   = data["fe"].astype(np.float32)   # (nq,)
+        n_skipped  = 0
+        loaded_idx = 0
+        for fpath in self.files:
+            keys = ["S0", "fe"]
+            if use_conditioning:
+                keys += ["V_vib", "omegas_ASE"]
+            try:
+                arrays = _load_npz_with_retry(fpath, keys=keys)
+            except RuntimeError as e:
+                print(f"  WARNING: skipping {fpath.name} — {e}")
+                n_skipped += 1
+                continue
+
+            S0 = arrays["S0"].astype(np.float32)   # (n_traj, n_frames, nq)
+            fe = arrays["fe"].astype(np.float32)   # (nq,)
 
             S0_ref = S0[:, 0:1, :]
             self._delta_S0.append((S0 - S0_ref) / (fe[None, None, :] + 1e-12))
 
             if use_conditioning:
-                V_raw  = data["V_vib"].astype(np.float32)
-                om_raw = data["omegas_ASE"].astype(np.float32)
+                V_raw  = arrays["V_vib"].astype(np.float32)
+                om_raw = arrays["omegas_ASE"].astype(np.float32)
                 three_N, n_modes = V_raw.shape
                 n_atoms = three_N // 3
 
@@ -129,7 +156,11 @@ class BeamstopDataset(Dataset):
             n_traj, n_frames, _ = S0.shape
             for ti in range(n_traj):
                 for fr in range(1, n_frames):
-                    self._index.append((fi, ti, fr))
+                    self._index.append((loaded_idx, ti, fr))
+            loaded_idx += 1
+
+        if n_skipped:
+            print(f"  {n_skipped} file(s) skipped due to read errors.")
 
     def __len__(self) -> int:
         return len(self._index)

@@ -95,6 +95,8 @@ class BeamstopDataset(Dataset):
         self.rng             = np.random.default_rng(seed)
 
         self.files = sorted(self.data_dir.glob("mol_*_pd.npz"))
+        self.loaded_files: list[Path] = []
+        self.skipped_files: list[Path] = []
         if not self.files:
             raise FileNotFoundError(f"No mol_*_pd.npz files found in {data_dir}")
 
@@ -127,6 +129,7 @@ class BeamstopDataset(Dataset):
             except RuntimeError as e:
                 print(f"  WARNING: skipping {fpath.name} — {e}")
                 n_skipped += 1
+                self.skipped_files.append(fpath)
                 continue
 
             S0 = arrays["S0"].astype(np.float32)   # (n_traj, n_frames, nq)
@@ -157,10 +160,13 @@ class BeamstopDataset(Dataset):
             for ti in range(n_traj):
                 for fr in range(1, n_frames):
                     self._index.append((loaded_idx, ti, fr))
+            self.loaded_files.append(fpath)
             loaded_idx += 1
 
         if n_skipped:
             print(f"  {n_skipped} file(s) skipped due to read errors.")
+        if not self.loaded_files:
+            raise RuntimeError(f"No usable mol_*_pd.npz files found in {data_dir}")
 
     def __len__(self) -> int:
         return len(self._index)
@@ -173,7 +179,7 @@ class BeamstopDataset(Dataset):
 
         # Sample q_min uniformly from [q_min_lo, q_min_hi] and build mask.
         q_min     = self.rng.uniform(self.q_min_lo, self.q_min_hi)
-        q_min_idx = int(q_min / self._dq)
+        q_min_idx = int(torch.searchsorted(self.q, torch.tensor(q_min), right=False))
         q_min_idx = max(0, min(q_min_idx, len(self.q) - 1))
 
         mask = torch.ones(len(self.q), dtype=torch.float32)

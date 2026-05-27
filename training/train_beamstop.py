@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from pathlib import Path
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -12,7 +12,7 @@ from data.Dataset.dataset_beamstop import BeamstopDataset
 from models.beamstop import BeamstopModel, build_sinc_operator, masked_loss, boundary_continuity_loss
 
 
-def compute_dataset_R_max(data_dir, margin=1.2):
+def compute_dataset_R_max(data_dir_or_files, margin=1.2):
     """
     Find the largest interatomic distance present in any frame of any molecule
     by scanning the saved pd_true arrays (which are histograms over R bins).
@@ -25,7 +25,12 @@ def compute_dataset_R_max(data_dir, margin=1.2):
     """
     max_R   = 0.0
     R_grid  = None
-    for fpath in sorted(Path(data_dir).glob("mol_*_pd.npz")):
+    if isinstance(data_dir_or_files, (str, Path)):
+        files = sorted(Path(data_dir_or_files).glob("mol_*_pd.npz"))
+    else:
+        files = list(data_dir_or_files)
+
+    for fpath in files:
         d = np.load(fpath)
         if R_grid is None:
             R_grid = d["R_grid"]
@@ -39,6 +44,53 @@ def compute_dataset_R_max(data_dir, margin=1.2):
 def build_truncated_R_grid(R_max, dR=0.025, R_min=0.025):
     """Uniform R-grid from R_min up to R_max."""
     return np.arange(R_min, R_max + dR, dR, dtype=np.float32)
+
+
+class FixedMaskSubset(Dataset):
+    """Subset wrapper with a fixed, deterministic q_min per base sample."""
+    def __init__(self, dataset, indices, seed=12345):
+        self.dataset = dataset
+        self.indices = list(indices)
+        self.seed = int(seed)
+        rng = np.random.default_rng(self.seed)
+        self.q_min = rng.uniform(
+            dataset.q_min_lo,
+            dataset.q_min_hi,
+            size=len(self.indices),
+        ).astype(np.float32)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        base_idx = self.indices[idx]
+        fi, ti, fr = self.dataset._index[base_idx]
+
+        delta_S0_norm = torch.from_numpy(self.dataset._delta_S0[fi][ti, fr])
+        q_min_idx = int(torch.searchsorted(
+            self.dataset.q,
+            torch.tensor(self.q_min[idx], dtype=self.dataset.q.dtype),
+            right=False,
+        ))
+        q_min_idx = max(0, min(q_min_idx, len(self.dataset.q) - 1))
+
+        mask = torch.ones(len(self.dataset.q), dtype=torch.float32)
+        mask[:q_min_idx] = 0.0
+
+        sample = {
+            "delta_S0_masked": delta_S0_norm * mask,
+            "delta_S0_norm":   delta_S0_norm,
+            "mask":            mask,
+            "mol_idx":         fi,
+            "traj_idx":        ti,
+            "frame_idx":       fr,
+        }
+        if self.dataset.use_conditioning:
+            sample["V_vib"]     = torch.from_numpy(self.dataset._V_vib[fi])
+            sample["omegas"]    = torch.from_numpy(self.dataset._omegas[fi])
+            sample["atom_mask"] = torch.from_numpy(self.dataset._atom_mask[fi])
+            sample["mode_mask"] = torch.from_numpy(self.dataset._mode_mask[fi])
+        return sample
 
 
 def warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps):
@@ -198,7 +250,7 @@ def train(
         }, os.path.join(checkpoint_dir, "latest_checkpoint.pt"))
 
     print(f"Training complete. Best val loss: {best_val_loss:.6f}")
-    return model
+    return model, best_val_loss
 
 
 if __name__ == "__main__":
@@ -224,12 +276,15 @@ if __name__ == "__main__":
     dataset = BeamstopDataset(data_dir, q_min_lo=0.5, q_min_hi=1.0,
                               max_atoms=75, max_modes=219,
                               use_conditioning=args.use_conditioning)
-    print(f"Dataset: {len(dataset):,} samples from {len(dataset.files)} molecules")
+    print(
+        f"Dataset: {len(dataset):,} samples from {len(dataset.loaded_files)} loaded "
+        f"molecules ({len(dataset.files)} found, {len(dataset.skipped_files)} skipped)"
+    )
 
     # Build data-driven R-grid: truncate to ~1.2× max interatomic distance.
     # Removes excess R-space DoF that can only fit low-q noise.
     print("Scanning dataset for max interatomic distance ...")
-    R_max_data = compute_dataset_R_max(data_dir, margin=args.R_margin)
+    R_max_data = compute_dataset_R_max(dataset.loaded_files, margin=args.R_margin)
     R_max      = min(R_max_data, args.R_cap)
     dR         = float(dataset.R_grid[1] - dataset.R_grid[0])
     R_grid_truncated = build_truncated_R_grid(R_max, dR=dR)
@@ -241,7 +296,7 @@ if __name__ == "__main__":
     B_sinc = build_sinc_operator(q_np, R_grid_truncated)
 
     # File-level train/val split.
-    n_files = len(dataset.files)
+    n_files = len(dataset.loaded_files)
     n_val   = max(1, int(0.1 * n_files))
 
     rng = np.random.default_rng(42)
@@ -270,7 +325,7 @@ if __name__ == "__main__":
         pin_memory=pin_memory,
     )
     val_loader = DataLoader(
-        Subset(dataset, val_idx),
+        FixedMaskSubset(dataset, val_idx, seed=12345),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=num_workers,

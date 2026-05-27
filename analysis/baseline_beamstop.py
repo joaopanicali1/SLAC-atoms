@@ -328,10 +328,13 @@ def run_eval(args):
                               q_min_hi=args.q_min_hi,
                               use_conditioning=False, seed=args.seed)
     q_np = dataset.q.numpy()
-    print(f"Dataset: {len(dataset):,} samples from {len(dataset.files)} mols")
+    print(
+        f"Dataset: {len(dataset):,} samples from {len(dataset.loaded_files)} loaded "
+        f"mols ({len(dataset.files)} found, {len(dataset.skipped_files)} skipped)"
+    )
 
     # Same file-level split as training (seed 42).
-    n_files = len(dataset.files)
+    n_files = len(dataset.loaded_files)
     n_val   = max(1, int(0.1 * n_files))
     rng     = np.random.default_rng(42)
     file_indices = np.arange(n_files); rng.shuffle(file_indices)
@@ -358,10 +361,13 @@ def run_eval(args):
     # Optional model load.
     model = None
     if args.checkpoint:
-        R_max = compute_dataset_R_max(args.data_dir, margin=args.R_margin)
-        dR    = float(dataset.R_grid[1] - dataset.R_grid[0])
+        R_max_data       = compute_dataset_R_max(dataset.loaded_files, margin=args.R_margin)
+        R_max            = min(R_max_data, args.R_cap)
+        dR               = float(dataset.R_grid[1] - dataset.R_grid[0])
         R_grid_truncated = build_truncated_R_grid(R_max, dR=dR)
         B_sinc = build_sinc_operator(q_np, R_grid_truncated, verbose=False)
+        print(f"R_max_data={R_max_data:.2f} Å  R_cap={args.R_cap:.2f} Å  "
+              f"→ R_max={R_max:.2f} Å  B_sinc={tuple(B_sinc.shape)}")
         model  = load_model(Path(args.checkpoint), B_sinc, args.n_channels,
                             use_conditioning=False, device=device)
 
@@ -390,8 +396,8 @@ def run_eval(args):
         y_mdl = None
         if model is not None:
             with torch.no_grad():
-                pred = model(sample["delta_S0_masked"].unsqueeze(0).to(device),
-                             sample["mask"].unsqueeze(0).to(device))
+                pred, _ = model(sample["delta_S0_masked"].unsqueeze(0).to(device),
+                                sample["mask"].unsqueeze(0).to(device))
             y_mdl = pred.cpu().numpy()[0]
             mdl_mse_all.append(masked_mse_per_sample(y_mdl[None], y_tgt[None], m[None])[0])
 
@@ -482,6 +488,7 @@ if __name__ == "__main__":
     p.add_argument("--q-min-lo",   type=float, default=0.5)
     p.add_argument("--q-min-hi",   type=float, default=1.0)
     p.add_argument("--R-margin",   type=float, default=1.2)
+    p.add_argument("--R-cap",     type=float, default=10.0, help="Hard cap on R_max (Å) — must match training config")
     p.add_argument("--max-samples", type=int, default=500, help="Limit val samples for quick checks")
     p.add_argument("--n-plot",     type=int, default=6, help="Number of sample panels to plot")
     p.add_argument("--plot",       default=None, help="Output path for comparison plot (PNG)")

@@ -1,54 +1,19 @@
-"""
-beamstop.py — Model for predicting the missing low-q scattering signal
-blocked by the beamstop in TRXSS experiments.
+"""Beamstop reconstruction model for low-q TRXSS signals.
 
-Task: ΔS0_norm(q ≥ q_min) → ΔS0_norm(all q)
+The model receives a normalized differential scattering curve with the low-q
+beamstop region zeroed out and predicts the complete curve:
 
-where ΔS0_norm = (S0(t) − S0_ref) / fe(q) is the normalized differential
-scattering signal and S0_ref = S0[ti, 0] is the first frame of the same
-trajectory, analogous to the pre-pump ground-state measurement in TRXSS.
+    ΔS0_norm(q observed) -> ΔS0_norm(all q)
 
-Physics constraints enforced by construction:
-  1. ΔS0_norm(q=0) = 0  — because S0(q=0) = (ΣZ_i)² is geometry-independent,
-                           enforced by zero-centering the R-space intermediate
-  2. Smoothness            — enforced architecturally via R-cap band-limiting
-                             (R_max controls fastest q-space oscillation period)
+where ΔS0_norm = (S0(t) - S0_ref) / fe(q), and S0_ref is the first frame of the
+same trajectory.
 
-Architecture (physics-guided encoder-decoder with mode-embedding FiLM conditioning):
-  MolEmbedding : V_vib + omegas + masks → mol_cond (d_cond,)
-                   per-atom MLP per mode → masked atom pool → cat ω
-                   → per-mode embed → masked mode pool → single vector
-  Encoder      : Conv1d in q-space, FiLM-conditioned on mol_cond
-                   → interpolate to nR
-                   → Conv1d in R-space, FiLM-conditioned on mol_cond
-                   → ΔPD_eff (batch, nR)
-  Decoder      : Differentiable Debye sum (mirrors simulate_scattering):
-                   zero-center(ΔPD_eff) → Σ_m ΔPD[m] · 2·j₀(q·R[m])
-                   → ΔS0_norm_pred (batch, nq)
-
-                 This is identical in structure to simulate_scattering's:
-                   bessel = sinc(q·r_ab / π)
-                   ΔS0 = 2 · Σ_pairs(fafb · bessel)
-                 but applied to the continuous R-grid pair density rather than
-                 discrete atom pairs (uniform form-factor weights, since ΔS0 is
-                 already normalized by fe).
-
-FiLM (Feature-wise Linear Modulation) applies per-channel scale γ and shift β
-derived from mol_cond after each activation: out = γ(mol_cond) * act + β(mol_cond).
-Initialized to identity (γ=1, β=0) so conditioning starts neutral.
-
-Loss (masked_loss):
-  Masked upweighting  — masked (low-q) MSE upweighted by lambda_masked
-                         relative to observed MSE, both per-q-point normalized
-
-Usage
------
-    from models.beamstop import BeamstopModel
-    model = BeamstopModel(q_tensor, R_grid_tensor, max_atoms=75, max_modes=219)
-    pred  = model(delta_S0_masked, mask, V_vib, omegas, atom_mask, mode_mask)
+The decoder is a fixed Debye/sinc projection from an R-space intermediate back
+to q-space. Zero-centering that intermediate enforces ΔS0_norm(q=0) = 0, while
+the truncated R grid acts as an architectural smoothness prior. The encoder can
+optionally condition on scalar molecular features.
 """
 
-import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -102,7 +67,7 @@ class FiLM(nn.Module):
     """
     Per-channel affine conditioning: out = (1 + γ(cond)) * x + β(cond).
 
-    Initialized to identity (all weights/biases zero → γ=1, β=0) so the
+    Initialized to identity (all weights/biases zero -> scale=1, shift=0) so the
     conditioning has no effect at the start of training.
 
     Parameters
@@ -125,91 +90,8 @@ class FiLM(nn.Module):
         return gamma * x + beta
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MolEmbedding — normal modes → single conditioning vector
-# ═════════════════════════════════════════════════════════════════════════════
-
-class MolEmbedding(nn.Module):
-    """
-    Encodes normal-mode eigenvectors and frequencies into a single conditioning
-    vector used by FiLM layers throughout the encoder.
-
-    Pipeline per molecule:
-      1. V_vib (3*max_atoms, max_modes) → (max_modes, max_atoms, 3)
-      2. atom_mlp applied to the last dim (3,): → (max_modes, max_atoms, d_atom)
-      3. Masked mean-pool over atoms (using atom_mask) → (max_modes, d_atom)
-      4. Concatenate ω_k → (max_modes, d_atom+1)
-      5. Linear out_proj → (max_modes, d_mode)
-      6. Thermal-amplitude-weighted pool over modes:
-         weight_k ∝ 1/ω_k² (proportional to A_k² = 2kBT/ω_k²),
-         masked by mode_mask → (d_mode,)
-      7. Linear final + LayerNorm → (d_cond,)
-
-    The 1/ω² weighting encodes the physical fact that low-frequency soft
-    modes have larger thermal amplitudes and dominate the structural signal,
-    especially in the low-q region the model is trying to recover. Plain
-    mean-pooling would dilute these dominant modes with stiff C-H stretches.
-
-    Parameters
-    ----------
-    max_atoms : padded atom count (must match V_vib first dim // 3)
-    d_atom    : hidden dim of per-atom MLP
-    d_mode    : per-mode embedding dim before final projection
-    d_cond    : output conditioning dim (fed to FiLM layers)
-    """
-    def __init__(self, max_atoms: int = 75, d_atom: int = 64,
-                 d_mode: int = 128, d_cond: int = 64):
-        super().__init__()
-        self.max_atoms = max_atoms
-
-        self.atom_mlp = nn.Sequential(
-            nn.Linear(3, d_atom),
-            nn.ReLU(),
-            nn.Linear(d_atom, d_mode),
-        )
-        self.out_proj = nn.Linear(d_mode + 1, d_mode)
-        self.final    = nn.Sequential(
-            nn.Linear(d_mode, d_cond),
-            nn.LayerNorm(d_cond),
-        )
-
-    def forward(self, V_vib: torch.Tensor, omegas: torch.Tensor,
-                atom_mask: torch.Tensor, mode_mask: torch.Tensor) -> torch.Tensor:
-        """
-        V_vib     : (batch, 3*max_atoms, max_modes)
-        omegas    : (batch, max_modes)
-        atom_mask : (batch, max_atoms)  bool — True for real atoms
-        mode_mask : (batch, max_modes)  bool — True for real modes
-
-        Returns   : (batch, d_cond)
-        """
-        batch, _, max_modes = V_vib.shape
-
-        # (batch, max_atoms, 3, max_modes) → (batch, max_modes, max_atoms, 3)
-        x = V_vib.reshape(batch, self.max_atoms, 3, max_modes).permute(0, 3, 1, 2)
-
-        # Per-atom embedding: (batch, max_modes, max_atoms, d_mode)
-        x = self.atom_mlp(x)
-
-        # Masked mean-pool over atoms: (batch, max_modes, d_mode)
-        atom_m = atom_mask.unsqueeze(1).unsqueeze(-1).float()   # (batch, 1, max_atoms, 1)
-        x = (x * atom_m).sum(dim=2) / atom_m.sum(dim=2).clamp(min=1)
-
-        # Concatenate frequency, project: (batch, max_modes, d_mode)
-        x = self.out_proj(torch.cat([x, omegas.unsqueeze(-1)], dim=-1))
-
-        # Thermal-amplitude-weighted pool over modes: weight ∝ 1/ω², masked.
-        # Soft (low-ω) modes have larger A_k = sqrt(2kBT)/ω_k and dominate the
-        # structural signal at low q — give them more weight in the embedding.
-        weight = 1.0 / (omegas.pow(2) + 1e-6)                    # (batch, max_modes)
-        weight = (weight * mode_mask.float()).unsqueeze(-1)      # (batch, max_modes, 1)
-        x = (x * weight).sum(dim=1) / weight.sum(dim=1).clamp(min=1e-6)
-
-        return self.final(x)                                    # (batch, d_cond)
-
-
 class MolFeatureEmbedding(nn.Module):
-    """Small MLP mapping normalized scalar molecular features to FiLM context."""
+    """Map normalized scalar molecular features to the FiLM context vector."""
 
     def __init__(self, n_features: int, d_cond: int = 64, hidden: int = 64):
         super().__init__()
@@ -241,7 +123,7 @@ class BeamstopEncoder(nn.Module):
     The mask channel tells the encoder which q values are observed vs. missing.
     Last Conv1d in each block is zero-initialized to prevent blow-up at init.
     """
-    def __init__(self, nq: int, nR: int, n_channels: int = 32,
+    def __init__(self, nR: int, n_channels: int = 32,
                  d_cond: int = 64, kernel_size: int = 5):
         super().__init__()
         self.nR = nR
@@ -294,11 +176,13 @@ class BeamstopEncoder(nn.Module):
 
 class BeamstopModel(nn.Module):
     """
-    Predicts the missing low-q region of ΔS0_norm, conditioned on the
-    molecule's normal modes and vibrational frequencies via FiLM.
+    Predict the missing low-q region of ΔS0_norm.
 
     The decoder is a pre-built Debye/sinc operator (B_sinc) stored as a buffer.
     Pre-building is more efficient than recomputing sinc every forward pass.
+
+    Set use_feature_conditioning=True to FiLM-condition on scalar molecular
+    features. With it disabled, the same encoder runs without molecular context.
 
     forward() returns a tuple (pred, delta_pd):
       pred     : (batch, nq) — full predicted ΔS0_norm
@@ -308,40 +192,26 @@ class BeamstopModel(nn.Module):
     Parameters
     ----------
     B_sinc     : (nR, nq) sinc/Debye operator  (from build_sinc_operator)
-    max_atoms  : padded atom count in V_vib             (default 75)
-    max_modes  : padded mode count in V_vib / omegas    (default 219)
-    d_atom     : hidden dim in per-atom MLP             (default 64)
-    d_mode     : per-mode embedding dim                 (default 128)
     d_cond     : FiLM conditioning vector dim           (default 64)
     n_channels : hidden channels in encoder CNNs        (default 32)
     kernel_size: Conv1d kernel size                     (default 5)
     """
-    def __init__(self, B_sinc: torch.Tensor, max_atoms: int = 75,
-                 max_modes: int = 219, d_atom: int = 64, d_mode: int = 128,
-                 d_cond: int = 64, n_channels: int = 32, kernel_size: int = 5,
-                 use_conditioning: bool = True,
+    def __init__(self, B_sinc: torch.Tensor, d_cond: int = 64,
+                 n_channels: int = 32, kernel_size: int = 5,
                  use_feature_conditioning: bool = False,
                  mol_feature_dim: int = 13):
         super().__init__()
         self.register_buffer('B_sinc', B_sinc.float())
-        self.use_conditioning = use_conditioning
         self.use_feature_conditioning = use_feature_conditioning
-        nR, nq = B_sinc.shape
+        nR, _ = B_sinc.shape
         self.d_cond    = d_cond
-        self.mol_embed = (
-            MolEmbedding(max_atoms, d_atom, d_mode, d_cond)
-            if use_conditioning and not use_feature_conditioning else None
-        )
         self.feature_embed = (
             MolFeatureEmbedding(mol_feature_dim, d_cond)
             if use_feature_conditioning else None
         )
-        self.encoder   = BeamstopEncoder(nq, nR, n_channels, d_cond, kernel_size)
+        self.encoder   = BeamstopEncoder(nR, n_channels, d_cond, kernel_size)
 
     def forward(self, delta_S0_masked: torch.Tensor, mask: torch.Tensor,
-                V_vib: torch.Tensor | None = None, omegas: torch.Tensor | None = None,
-                atom_mask: torch.Tensor | None = None,
-                mode_mask: torch.Tensor | None = None,
                 mol_features: torch.Tensor | None = None,
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -349,11 +219,7 @@ class BeamstopModel(nn.Module):
         ----------
         delta_S0_masked : (batch, nq)              — ΔS0_norm with q < q_min = 0
         mask            : (batch, nq)              — 1=observed, 0=masked
-        V_vib           : (batch, 3*max_atoms, max_modes)  required if use_conditioning
-        omegas          : (batch, max_modes)                required if use_conditioning
-        atom_mask       : (batch, max_atoms)  bool          required if use_conditioning
-        mode_mask       : (batch, max_modes)  bool          required if use_conditioning
-        mol_features    : (batch, mol_feature_dim)          required if use_feature_conditioning
+        mol_features    : (batch, mol_feature_dim)  required if use_feature_conditioning
 
         Returns
         -------
@@ -362,9 +228,9 @@ class BeamstopModel(nn.Module):
                                  exposed for Tikhonov regularisation
         """
         if self.use_feature_conditioning:
+            if mol_features is None:
+                raise ValueError("mol_features is required when use_feature_conditioning=True")
             mol_cond = self.feature_embed(mol_features)
-        elif self.use_conditioning:
-            mol_cond = self.mol_embed(V_vib, omegas, atom_mask, mode_mask)
         else:
             mol_cond = delta_S0_masked.new_zeros(delta_S0_masked.shape[0], self.d_cond)
 
@@ -386,37 +252,27 @@ class BeamstopModel(nn.Module):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def masked_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor,
-                lambda_masked: float = 10.0, lambda_smooth: float = 0.0) -> torch.Tensor:
+                lambda_smooth: float = 0.0) -> torch.Tensor:
     """
-    Combined loss with masked-region upweighting and optional smoothness.
+    Masked-region MSE with optional smoothness.
 
-    Masked upweighting  — masked (low-q) MSE normalized per q-point and
-                          multiplied by lambda_masked vs observed region.
+    BeamstopModel.forward hard-pastes observed q values into the output, so the
+    observed-region residual is identically zero. The useful data term is only
+    the masked low-q region.
     Smoothness          — second-derivative penalty over the full q range.
-                          BeamstopModel.forward hard-pastes observed values
-                          into the output, so smoothness in the observed
-                          region is a constant w.r.t. parameters (no gradient
-                          there). The gradient signal lands on the masked
-                          region and on the boundary between the two —
-                          enforcing both intra-gap smoothness and continuity
-                          with the measurement at q = q_min.
 
     Parameters
     ----------
     pred, target  : (batch, nq)
     mask          : (batch, nq)  1=observed, 0=masked
-    lambda_masked : upweight factor for masked region (default 10)
     lambda_smooth : smoothness penalty weight          (default 0)
     """
     residual = pred - target
 
-    n_obs  = mask.sum(dim=-1, keepdim=True).clamp(min=1)
     n_mask = (1 - mask).sum(dim=-1, keepdim=True).clamp(min=1)
 
-    mse_obs  = (residual.pow(2) * mask      / n_obs ).sum(dim=-1).mean()
-    mse_mask = (residual.pow(2) * (1-mask)  / n_mask).sum(dim=-1).mean()
+    loss = (residual.pow(2) * (1 - mask) / n_mask).sum(dim=-1).mean()
 
-    loss = mse_obs + lambda_masked * mse_mask
     if lambda_smooth > 0:
         d2     = pred[:, 2:] - 2 * pred[:, 1:-1] + pred[:, :-2]
         smooth = d2.pow(2).mean()
@@ -492,46 +348,26 @@ if __name__ == '__main__':
     if npz_files:
         ref  = np.load(npz_files[0])
         q_np = ref['q'];  R_np = ref['R_grid']
-        omegas_np = ref['omegas_ASE'];  V_vib_np = ref['V_vib']
         print(f'Building B_sinc from {npz_files[0]}')
-        print(f'omegas: {omegas_np.shape}, V_vib: {V_vib_np.shape}')
     else:
         print('No data found — using synthetic data')
         q_np      = np.arange(1e-4, 10.1, 0.1, dtype=np.float32)
         R_np      = np.linspace(0.025, 31.4, 1257, dtype=np.float32)
-        omegas_np = np.linspace(50, 3500, 30, dtype=np.float32)
-        V_vib_np  = np.random.randn(30, 30).astype(np.float32)
 
-    MAX_ATOMS = 75; MAX_MODES = 219
     B_sinc = build_sinc_operator(q_np, R_np)
-    model  = BeamstopModel(B_sinc, max_atoms=MAX_ATOMS, max_modes=MAX_MODES,
-                           n_channels=32)
+    model  = BeamstopModel(B_sinc, n_channels=32)
 
     batch     = 4
     nq        = len(q_np)
     dq        = float(q_np[1] - q_np[0])
     q_min_idx = int(0.75 / dq)
 
-    # Build padded inputs
-    n_modes = len(omegas_np);  n_atoms = V_vib_np.shape[0] // 3
-    V_pad   = np.zeros((3 * MAX_ATOMS, MAX_MODES), dtype=np.float32)
-    V_pad[:3*n_atoms, :n_modes] = V_vib_np[:3*n_atoms, :n_modes]
-    om_pad  = np.zeros(MAX_MODES, dtype=np.float32)
-    om_pad[:n_modes] = omegas_np
-
-    V_vib_t   = torch.tensor(V_pad).unsqueeze(0).expand(batch, -1, -1)
-    omegas_t  = torch.tensor(om_pad).unsqueeze(0).expand(batch, -1)
-    atom_mask = torch.zeros(batch, MAX_ATOMS, dtype=torch.bool)
-    atom_mask[:, :n_atoms] = True
-    mode_mask = torch.zeros(batch, MAX_MODES, dtype=torch.bool)
-    mode_mask[:, :n_modes] = True
-
     mask          = torch.ones(batch, nq)
     mask[:, :q_min_idx] = 0.0
     delta_S0      = torch.randn(batch, nq) * 0.1
     delta_S0_masked = delta_S0 * mask
 
-    pred, delta_pd = model(delta_S0_masked, mask, V_vib_t, omegas_t, atom_mask, mode_mask)
+    pred, delta_pd = model(delta_S0_masked, mask)
     loss = masked_loss(pred, delta_S0, mask)
 
     print(f'pred shape   : {tuple(pred.shape)}')

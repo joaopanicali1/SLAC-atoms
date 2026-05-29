@@ -209,11 +209,10 @@ def masked_mse_per_sample(pred: np.ndarray, target: np.ndarray,
 
 
 def load_model(checkpoint_path: Path, B_sinc: torch.Tensor, n_channels: int,
-                use_conditioning: bool, use_mol_features: bool,
+                use_mol_features: bool,
                 mol_feature_dim: int, device: torch.device):
     from models.beamstop import BeamstopModel
     model = BeamstopModel(B_sinc, n_channels=n_channels,
-                          use_conditioning=use_conditioning,
                           use_feature_conditioning=use_mol_features,
                           mol_feature_dim=mol_feature_dim).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -274,7 +273,6 @@ def run_eval(args):
         print(f"R_max_data={R_max_data:.2f} Å  R_cap={args.R_cap:.2f} Å  "
               f"→ R_max={R_max:.2f} Å  B_sinc={tuple(B_sinc.shape)}")
         model  = load_model(Path(args.checkpoint), B_sinc, args.n_channels,
-                            use_conditioning=False,
                             use_mol_features=args.use_mol_features,
                             mol_feature_dim=mol_feature_dim or 13,
                             device=device)

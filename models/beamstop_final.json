@@ -1,0 +1,22 @@
+{
+  "model": "BeamstopModel",
+  "checkpoint": "models/beamstop_final.pt",
+  "source_checkpoint": "checkpoints/beamstop_features_expanded/trial34_params/best_model.pt",
+  "dataset": "data/trajectory_data_cap200_new",
+  "split_file": "split_beamstop.npy",
+  "split_semantics": "split_beamstop.npy is a shuffled molecule index order; first 10% is validation, remaining 90% is training. No separate held-out test split is currently defined.",
+  "conditioning": "scalar_molecular_features",
+  "mol_feature_dim": 13,
+  "n_channels": 128,
+  "R_cap": 9.451833630105082,
+  "lambda_boundary": 0.45026251076764284,
+  "lambda_pd": 1.8997338367460246e-05,
+  "lambda_masked": 10.0,
+  "lambda_smooth": 0.0,
+  "training_command_source": "training/submit_train_beamstop_features_expanded.slurm",
+  "training_job_id": 87978,
+  "training_best_val_loss": 0.000105,
+  "comparison_baseline": "NSK",
+  "final_eval_command_source": "analysis/beamstop/submit_eval_beamstop_features_benchmark.slurm",
+  "git_commit_at_metadata_creation": "bc64d3d"
+}

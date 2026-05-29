@@ -99,11 +99,6 @@ class FixedMaskSubset(Dataset):
             "traj_idx":        ti,
             "frame_idx":       fr,
         }
-        if self.dataset.use_conditioning:
-            sample["V_vib"]     = torch.from_numpy(self.dataset._V_vib[fi])
-            sample["omegas"]    = torch.from_numpy(self.dataset._omegas[fi])
-            sample["atom_mask"] = torch.from_numpy(self.dataset._atom_mask[fi])
-            sample["mode_mask"] = torch.from_numpy(self.dataset._mode_mask[fi])
         if self.dataset.use_mol_features:
             sample["mol_features"] = torch.from_numpy(self.dataset._mol_features[fi])
         return sample
@@ -120,8 +115,8 @@ def warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps):
 
 
 def run_epoch(model, loader, optimizer, scheduler, device,
-              use_conditioning, lambda_masked, lambda_smooth, lambda_boundary,
-              lambda_pd, train=True, use_mol_features=False):
+              lambda_smooth, lambda_boundary, lambda_pd,
+              train=True, use_mol_features=False):
     model.train() if train else model.eval()
 
     total_loss = 0.0
@@ -135,15 +130,7 @@ def run_epoch(model, loader, optimizer, scheduler, device,
             delta_S0_norm   = batch["delta_S0_norm"].to(device)
             mask            = batch["mask"].to(device)
 
-            if use_conditioning:
-                pred, delta_pd = model(
-                    delta_S0_masked, mask,
-                    batch["V_vib"].to(device),
-                    batch["omegas"].to(device),
-                    batch["atom_mask"].to(device),
-                    batch["mode_mask"].to(device),
-                )
-            elif use_mol_features:
+            if use_mol_features:
                 pred, delta_pd = model(
                     delta_S0_masked, mask,
                     mol_features=batch["mol_features"].to(device),
@@ -152,7 +139,6 @@ def run_epoch(model, loader, optimizer, scheduler, device,
                 pred, delta_pd = model(delta_S0_masked, mask)
 
             loss = masked_loss(pred, delta_S0_norm, mask,
-                               lambda_masked=lambda_masked,
                                lambda_smooth=lambda_smooth)
             if lambda_boundary > 0:
                 loss = loss + lambda_boundary * boundary_continuity_loss(
@@ -185,10 +171,8 @@ def train(
     lr=1e-3,
     n_warmup_epochs=5,
     n_channels=32,
-    use_conditioning=True,
     use_mol_features=False,
     mol_feature_dim=13,
-    lambda_masked=10.0,
     lambda_smooth=1e-3,
     lambda_boundary=0.0,
     lambda_pd=0.0,
@@ -202,9 +186,7 @@ def train(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Training on {device}")
-    print(f"use_conditioning : {use_conditioning}")
     print(f"use_mol_features : {use_mol_features}")
-    print(f"lambda_masked    : {lambda_masked}")
     print(f"lambda_smooth    : {lambda_smooth}")
     print(f"lambda_boundary  : {lambda_boundary}")
     print(f"lambda_pd        : {lambda_pd}")
@@ -214,7 +196,6 @@ def train(
 
     model = BeamstopModel(
         B_sinc, n_channels=n_channels, kernel_size=5,
-        use_conditioning=use_conditioning,
         use_feature_conditioning=use_mol_features,
         mol_feature_dim=mol_feature_dim,
     ).to(device)
@@ -248,12 +229,10 @@ def train(
     for epoch in range(1, n_epochs + 1):
         epoch_t0 = time.perf_counter()
         train_loss = run_epoch(model, train_loader, optimizer, scheduler, device,
-                               use_conditioning, lambda_masked, lambda_smooth,
-                               lambda_boundary, lambda_pd, train=True,
+                               lambda_smooth, lambda_boundary, lambda_pd, train=True,
                                use_mol_features=use_mol_features)
         val_loss   = run_epoch(model, val_loader,   optimizer, scheduler, device,
-                               use_conditioning, lambda_masked, lambda_smooth,
-                               lambda_boundary, lambda_pd, train=False,
+                               lambda_smooth, lambda_boundary, lambda_pd, train=False,
                                use_mol_features=use_mol_features)
         epoch_seconds = time.perf_counter() - epoch_t0
 
@@ -320,9 +299,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-channels",       type=int,   default=32,                      help="Hidden channels in encoder CNNs")
     parser.add_argument("--data-dir",         type=str,   default="data/trajectory_data_cap200", help="Directory containing mol_*_pd.npz trajectory files")
     parser.add_argument("--checkpoint-dir",   type=str,   default="checkpoints/beamstop",  help="Directory to save checkpoints")
-    parser.add_argument("--use-conditioning", action="store_true", default=False,           help="Enable FiLM conditioning on normal modes")
     parser.add_argument("--use-mol-features", action="store_true", default=False,           help="Enable FiLM conditioning on scalar molecular features")
-    parser.add_argument("--lambda-masked",    type=float, default=10.0,                    help="Upweight factor for masked (low-q) loss region")
     parser.add_argument("--lambda-smooth",    type=float, default=0.0,                     help="Smoothness penalty weight (default 0; B_sinc is band-limited by construction)")
     parser.add_argument("--R-margin",         type=float, default=1.2,                     help="Multiplicative margin on max interatomic distance for R-grid truncation")
     parser.add_argument("--R-cap",            type=float, default=10.0,                    help="Hard cap on R_max (Å); architectural band-limit — smaller cap = smoother low-q output")
@@ -338,12 +315,10 @@ if __name__ == "__main__":
     parser.add_argument("--max-runtime-min",  type=float, default=None,                     help="Stop cleanly before this many training minutes elapse")
     parser.add_argument("--stop-buffer-min",  type=float, default=10.0,                     help="Runtime buffer minutes reserved before max runtime")
     args = parser.parse_args()
-    if args.use_conditioning and args.use_mol_features:
-        parser.error("--use-conditioning and --use-mol-features are mutually exclusive for now")
 
     dataset = BeamstopDataset(args.data_dir, q_min_lo=0.5, q_min_hi=1.0,
                               max_atoms=75, max_modes=219,
-                              use_conditioning=args.use_conditioning,
+                              use_conditioning=False,
                               use_mol_features=args.use_mol_features)
     print(
         f"Dataset: {len(dataset):,} samples from {len(dataset.loaded_files)} loaded "
@@ -412,10 +387,8 @@ if __name__ == "__main__":
     train(train_loader=train_loader, val_loader=val_loader,
           B_sinc=B_sinc,
           n_channels=args.n_channels, checkpoint_dir=args.checkpoint_dir,
-          use_conditioning=args.use_conditioning,
           use_mol_features=args.use_mol_features,
           mol_feature_dim=mol_feature_dim,
-          lambda_masked=args.lambda_masked,
           lambda_smooth=args.lambda_smooth,
           lambda_boundary=args.lambda_boundary,
           lambda_pd=args.lambda_pd,

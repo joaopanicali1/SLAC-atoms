@@ -20,6 +20,11 @@ Usage
 
     # Run one trial locally (testing)
     python training/sweep_beamstop_optuna.py --run-trial
+python training/sweep_beamstop_optuna.py \
+  --submit --n-jobs 20 \
+  --partition gpu-pascal \
+  --time-limit 04:00:00 \
+  --conda-env SLAC-p100
 """
 
 import argparse
@@ -38,6 +43,8 @@ SWEEP_DIR    = PROJECT_DIR / "checkpoints/optuna"
 DB_PATH      = SWEEP_DIR / "beamstop.db"
 LOG_DIR      = PROJECT_DIR / "training/logs"
 PARTITION    = "gpu-volta"
+TIME_LIMIT   = "04:00:00"
+CONDA_ENV    = os.environ.get("SLAC_ATOMS_CONDA_ENV", "SLAC")
 DATA_DIR     = PROJECT_DIR / "data/trajectory_data_cap200"
 
 # ─── Search space ───────────────────────────────────────────────────────────
@@ -67,6 +74,11 @@ FIXED = dict(
     lambda_smooth = 0.0,
     lambda_masked = 10.0,
     num_workers   = 0,
+    pin_memory    = False,
+    n_epochs      = 30,
+    n_warmup_epochs = 2,
+    max_runtime_min = None,
+    stop_buffer_min = 10.0,
 )
 
 
@@ -131,12 +143,16 @@ def objective(trial):
     train_loader = DataLoader(
         Subset(dataset, train_idx),
         batch_size=FIXED["batch_size"], shuffle=True,
-        num_workers=FIXED["num_workers"], pin_memory=False,
+        num_workers=FIXED["num_workers"], pin_memory=FIXED["pin_memory"],
+        persistent_workers=(FIXED["num_workers"] > 0),
+        prefetch_factor=4 if FIXED["num_workers"] > 0 else None,
     )
     val_loader = DataLoader(
         FixedMaskSubset(dataset, val_idx, seed=12345),
         batch_size=FIXED["batch_size"], shuffle=False,
-        num_workers=FIXED["num_workers"], pin_memory=False,
+        num_workers=FIXED["num_workers"], pin_memory=FIXED["pin_memory"],
+        persistent_workers=(FIXED["num_workers"] > 0),
+        prefetch_factor=4 if FIXED["num_workers"] > 0 else None,
     )
 
     ckpt_dir = SWEEP_DIR / f"trial_{trial.number:04d}"
@@ -154,6 +170,13 @@ def objective(trial):
         lambda_boundary = lambda_boundary,
         lambda_pd       = lambda_pd,
         lr              = lr,
+        n_epochs        = FIXED["n_epochs"],
+        n_warmup_epochs = FIXED["n_warmup_epochs"],
+        max_runtime_seconds = (
+            None if FIXED["max_runtime_min"] is None
+            else FIXED["max_runtime_min"] * 60.0
+        ),
+        stop_buffer_seconds = FIXED["stop_buffer_min"] * 60.0,
     )
     return best_val
 
@@ -183,14 +206,17 @@ def cmd_submit(args):
     cmd_create(args)
 
     partition = args.partition or PARTITION
+    time_limit = args.time_limit or TIME_LIMIT
+    conda_env = args.conda_env or CONDA_ENV
+    pin_memory_arg = "--pin-memory" if args.pin_memory else ""
     script = f"""\
 #!/bin/bash
 #SBATCH --job-name=bs_optuna
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task={args.cpus_per_task}
+#SBATCH --mem={args.mem}
+#SBATCH --time={time_limit}
 #SBATCH --partition={partition}
 #SBATCH --gres=gpu:1
 #SBATCH --output={LOG_DIR}/optuna_%j.out
@@ -198,17 +224,25 @@ def cmd_submit(args):
 
 cd {PROJECT_DIR}
 source ~/.bashrc
-conda activate SLAC
+conda activate {conda_env}
 
 mkdir -p {LOG_DIR}
 
-PYTHONPATH={PROJECT_DIR} python -u training/sweep_beamstop_optuna.py --run-trial
+PYTHONPATH={PROJECT_DIR} python -u training/sweep_beamstop_optuna.py --run-trial \\
+  --study-name {STUDY_NAME} \\
+  --batch-size {args.batch_size} \\
+  --num-workers {args.num_workers} \\
+  --n-epochs {args.n_epochs} \\
+  --n-warmup-epochs {args.n_warmup_epochs} \\
+  --max-runtime-min {args.max_runtime_min} \\
+  --stop-buffer-min {args.stop_buffer_min} \\
+  {pin_memory_arg}
 """
 
     tmp = Path("/tmp/sweep_optuna.slurm")
     tmp.write_text(script)
 
-    print(f"\nSubmitting {args.n_jobs} jobs to '{partition}' …")
+    print(f"\nSubmitting {args.n_jobs} jobs to '{partition}' with time limit {time_limit} and conda env '{conda_env}' …")
     submitted = 0
     for _ in range(args.n_jobs):
         res = subprocess.run(["sbatch", str(tmp)], capture_output=True, text=True)
@@ -297,10 +331,39 @@ if __name__ == "__main__":
                    help="Number of SLURM jobs to submit (default 25, ~5× n_params)")
     p.add_argument("--partition", type=str, default=None,
                    help=f"SLURM partition (default: {PARTITION})")
+    p.add_argument("--time-limit", type=str, default=None,
+                   help=f"SLURM time limit (default: {TIME_LIMIT})")
+    p.add_argument("--conda-env", type=str, default=None,
+                   help=f"Conda environment for SLURM jobs (default: {CONDA_ENV})")
     p.add_argument("--study-name", type=str, default=STUDY_NAME,
                    help=f"Optuna study name (default: {STUDY_NAME})")
+    p.add_argument("--batch-size", type=int, default=FIXED["batch_size"],
+                   help=f"Batch size for each trial (default: {FIXED['batch_size']})")
+    p.add_argument("--num-workers", type=int, default=FIXED["num_workers"],
+                   help=f"DataLoader workers per trial (default: {FIXED['num_workers']})")
+    p.add_argument("--pin-memory", action="store_true", default=FIXED["pin_memory"],
+                   help="Enable DataLoader pinned-memory transfers")
+    p.add_argument("--n-epochs", type=int, default=FIXED["n_epochs"],
+                   help=f"Maximum epochs per trial (default: {FIXED['n_epochs']})")
+    p.add_argument("--n-warmup-epochs", type=int, default=FIXED["n_warmup_epochs"],
+                   help=f"LR warmup epochs (default: {FIXED['n_warmup_epochs']})")
+    p.add_argument("--max-runtime-min", type=float, default=FIXED["max_runtime_min"],
+                   help="Stop a trial cleanly before this many training minutes elapse")
+    p.add_argument("--stop-buffer-min", type=float, default=FIXED["stop_buffer_min"],
+                   help=f"Runtime buffer minutes reserved before max runtime (default: {FIXED['stop_buffer_min']})")
+    p.add_argument("--cpus-per-task", type=int, default=4,
+                   help="SLURM CPUs per job for --submit (default: 4)")
+    p.add_argument("--mem", type=str, default="32G",
+                   help="SLURM memory per job for --submit (default: 32G)")
     args = p.parse_args()
     STUDY_NAME = args.study_name
+    FIXED["batch_size"] = args.batch_size
+    FIXED["num_workers"] = args.num_workers
+    FIXED["pin_memory"] = args.pin_memory
+    FIXED["n_epochs"] = args.n_epochs
+    FIXED["n_warmup_epochs"] = args.n_warmup_epochs
+    FIXED["max_runtime_min"] = args.max_runtime_min
+    FIXED["stop_buffer_min"] = args.stop_buffer_min
 
     if args.create:
         cmd_create(args)

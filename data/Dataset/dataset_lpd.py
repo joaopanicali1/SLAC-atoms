@@ -32,6 +32,7 @@ Usage
 
 import time
 import zipfile
+import zlib
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
@@ -51,7 +52,7 @@ def _load_npz_with_retry(fpath, keys=("dS0", "pd_true"), max_retries=4, backoff=
             d = np.load(fpath)
             arrays = {k: np.asarray(d[k]) for k in keys}   # force full read of each array
             return arrays
-        except (zipfile.BadZipFile, OSError) as e:
+        except (zipfile.BadZipFile, OSError, zlib.error) as e:
             last_err = e
             if attempt < max_retries - 1:
                 time.sleep(backoff * (attempt + 1))
@@ -79,6 +80,8 @@ class LPDDataset(Dataset):
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
         self.files = sorted(self.data_dir.glob("mol_*_pd.npz"))
+        self.loaded_files: list[Path] = []
+        self.skipped_files: list[Path] = []
 
         if not self.files:
             raise FileNotFoundError(f"No mol_*_pd.npz files found in {data_dir}")
@@ -103,6 +106,7 @@ class LPDDataset(Dataset):
             except RuntimeError as e:
                 print(f"  WARNING: skipping {fpath.name} — {e}")
                 n_skipped += 1
+                self.skipped_files.append(fpath)
                 continue
 
             dS0_arr = arrays["dS0"].astype(np.float32)
@@ -115,10 +119,13 @@ class LPDDataset(Dataset):
             for ti in range(n_traj):
                 for fr in range(n_frames):
                     self._index.append((loaded_idx, ti, fr))
+            self.loaded_files.append(fpath)
             loaded_idx += 1
 
         if n_skipped:
             print(f"  {n_skipped} file(s) skipped due to read errors.")
+        if not self.loaded_files:
+            raise RuntimeError(f"No usable mol_*_pd.npz files found in {data_dir}")
 
     def __len__(self) -> int:
         return len(self._index)

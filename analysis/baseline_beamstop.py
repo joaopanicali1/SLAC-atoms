@@ -1,31 +1,7 @@
-"""
-baseline_beamstop.py — Non-ML polynomial-extrapolation baseline for the
-beamstop reconstruction task.
+"""Evaluate the NSK low-q extrapolation baseline for beamstop reconstruction.
 
-For each sample, fit a low-order polynomial in q² to the observed ΔS0_norm
-in a local window above q_min, then extrapolate into the masked low-q region.
-
-    p(q) = a₁q² + a₂q⁴ + a₃q⁶                  (parity="even", default)
-    p(q) = a₁q  + a₂q² + a₃q³                  (parity="all")
-
-Both forms drop the constant term, enforcing ΔS₀(q=0) = 0 exactly. The
-"even" form additionally respects the parity of S₀(q) — S₀ depends on q only
-through even functions (sinc(qR), cos(qR)·…), so ΔS₀ should too. This
-removes a non-physical degree of freedom (nonzero slope at q=0) that "all"
-permits.
-
-Fit by ordinary least squares on q points inside [q_min, q_min + window].
-Local windowing keeps the fit anchored to the data nearest the gap rather
-than being dominated by high-q noise.
-
-Usage
------
-    from analysis.baseline_beamstop import PolynomialBaseline
-    bl = PolynomialBaseline(n_terms=3, parity="even", window=1.5)
-    pred = bl.predict(q, delta_S0_masked, mask)  # numpy
-
-Run as a script to evaluate on the same val split as training and (if a
-checkpoint is provided) compare against a trained BeamstopModel.
+Run as a script to evaluate on the same val split as training and, if a
+checkpoint is provided, compare against a trained BeamstopModel.
 
     python analysis/baseline_beamstop.py \
         --checkpoint checkpoints/beamstop_128/best_model.pt \
@@ -48,88 +24,8 @@ os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
 import numpy as np
 import torch
 
-torch.backends.nnpack.enabled = False  # belt-and-braces: skip NNPACK path
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Polynomial baseline
-# ═════════════════════════════════════════════════════════════════════════════
-
-class PolynomialBaseline:
-    """
-    Per-sample polynomial extrapolation into the masked region.
-
-    Parameters
-    ----------
-    n_terms : number of polynomial terms (default 3 → 3 free coefficients).
-    parity  : "even" (default) → p(q) = a₁q² + a₂q⁴ + a₃q⁶ + ...
-              "all"             → p(q) = a₁q  + a₂q² + a₃q³ + ...
-              The "even" form respects ΔS₀'s parity in q (S₀ depends on q
-              only through even functions of q·R) and gives zero slope at
-              q=0, removing a non-physical degree of freedom. p(0)=0 is
-              enforced exactly in both cases by omitting the constant term.
-    window  : width of the fit window above q_min, in Å⁻¹ (default 1.5).
-              Smaller → more local, more sensitive to noise. Larger →
-              smoother, but biased by curvature far from the gap.
-    """
-    def __init__(self, n_terms: int = 3, parity: str = "even", window: float = 1.5):
-        if n_terms < 1:
-            raise ValueError("n_terms must be ≥ 1")
-        if parity not in ("even", "all"):
-            raise ValueError("parity must be 'even' or 'all'")
-        self.n_terms = n_terms
-        self.parity  = parity
-        self.window  = float(window)
-        if parity == "even":
-            self._powers = [2 * k for k in range(1, n_terms + 1)]   # 2, 4, 6, ...
-        else:
-            self._powers = list(range(1, n_terms + 1))              # 1, 2, 3, ...
-
-    def _fit_one(self, q_fit: np.ndarray, y_fit: np.ndarray) -> np.ndarray:
-        X = np.stack([q_fit ** k for k in self._powers], axis=1)
-        coef, *_ = np.linalg.lstsq(X, y_fit, rcond=None)
-        return coef
-
-    def _eval_poly(self, q: np.ndarray, coef: np.ndarray) -> np.ndarray:
-        return sum(c * q ** k for c, k in zip(coef, self._powers))
-
-    def predict(self, q, delta_S0_masked, mask) -> np.ndarray:
-        """
-        Parameters
-        ----------
-        q                : (nq,)            q grid in Å⁻¹
-        delta_S0_masked  : (..., nq)        observed values (zero in masked region)
-        mask             : (..., nq)        1=observed, 0=masked
-
-        Returns
-        -------
-        pred : (..., nq)  Full ΔS0_norm — observed values in the observed
-               region, polynomial extrapolation in the masked region.
-        """
-        q     = np.asarray(q,               dtype=np.float64)
-        y_all = np.asarray(delta_S0_masked, dtype=np.float64)
-        m_all = np.asarray(mask,            dtype=np.float64)
-
-        squeeze = y_all.ndim == 1
-        if squeeze:
-            y_all = y_all[None]
-            m_all = m_all[None]
-
-        out = y_all.copy()
-        for b in range(y_all.shape[0]):
-            m   = m_all[b]
-            obs = m > 0.5
-            if not obs.any():
-                continue
-            q_min     = q[obs].min()
-            fit_in    = obs & (q <= q_min + self.window)
-            if fit_in.sum() < self.n_terms:
-                fit_in = obs
-            coef      = self._fit_one(q[fit_in], y_all[b, fit_in])
-            masked_in = ~obs
-            out[b, masked_in] = self._eval_poly(q[masked_in], coef)
-
-        return out[0] if squeeze else out
+if hasattr(torch.backends, "nnpack"):
+    torch.backends.nnpack.enabled = False  # belt-and-braces: skip NNPACK path
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -213,7 +109,15 @@ class NSKBaseline:
         return v0, v1, v2
 
     def predict(self, q, delta_S0_masked, mask) -> np.ndarray:
-        """See PolynomialBaseline.predict for the I/O contract."""
+        """
+        Predict the full ΔS0_norm signal.
+
+        Parameters
+        ----------
+        q                : (nq,)      q grid in Å⁻¹
+        delta_S0_masked  : (..., nq)  observed values, zero in masked region
+        mask             : (..., nq)  1=observed, 0=masked
+        """
         q     = np.asarray(q,               dtype=np.float64)
         y_all = np.asarray(delta_S0_masked, dtype=np.float64)
         m_all = np.asarray(mask,            dtype=np.float64)
@@ -305,10 +209,13 @@ def masked_mse_per_sample(pred: np.ndarray, target: np.ndarray,
 
 
 def load_model(checkpoint_path: Path, B_sinc: torch.Tensor, n_channels: int,
-                use_conditioning: bool, device: torch.device):
+                use_conditioning: bool, use_mol_features: bool,
+                mol_feature_dim: int, device: torch.device):
     from models.beamstop import BeamstopModel
     model = BeamstopModel(B_sinc, n_channels=n_channels,
-                          use_conditioning=use_conditioning).to(device)
+                          use_conditioning=use_conditioning,
+                          use_feature_conditioning=use_mol_features,
+                          mol_feature_dim=mol_feature_dim).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -326,12 +233,17 @@ def run_eval(args):
 
     dataset = BeamstopDataset(args.data_dir, q_min_lo=args.q_min_lo,
                               q_min_hi=args.q_min_hi,
-                              use_conditioning=False, seed=args.seed)
+                              use_conditioning=False,
+                              use_mol_features=args.use_mol_features,
+                              seed=args.seed)
     q_np = dataset.q.numpy()
     print(
         f"Dataset: {len(dataset):,} samples from {len(dataset.loaded_files)} loaded "
         f"mols ({len(dataset.files)} found, {len(dataset.skipped_files)} skipped)"
     )
+    mol_feature_dim = len(dataset._mol_features[0]) if args.use_mol_features else 0
+    if args.use_mol_features:
+        print(f"mol_feature_dim={mol_feature_dim}")
 
     # Same file-level split as training (seed 42).
     n_files = len(dataset.loaded_files)
@@ -344,19 +256,12 @@ def run_eval(args):
         val_idx = val_idx[:args.max_samples]
     print(f"Evaluating on {len(val_idx):,} val samples")
 
-    if args.baseline == "nsk":
-        baseline      = NSKBaseline(R_max=args.r_max, dR=args.dr_basis,
-                                    eps=args.eps, lambda_R=args.lambda_R,
-                                    lambda_cont=args.lambda_cont)
-        baseline_desc = (f"NSK (R_max={args.r_max} Å, dR={args.dr_basis} Å, "
-                         f"M={len(baseline.R_grid)}, λ_R={args.lambda_R}, "
-                         f"λ_cont={args.lambda_cont}, ε={args.eps})")
-    else:
-        baseline      = PolynomialBaseline(n_terms=args.n_terms,
-                                           parity=args.parity,
-                                           window=args.window)
-        baseline_desc = (f"polynomial (parity={args.parity}, "
-                         f"n_terms={args.n_terms}, window={args.window} Å⁻¹)")
+    baseline = NSKBaseline(R_max=args.r_max, dR=args.dr_basis,
+                           eps=args.eps, lambda_R=args.lambda_R,
+                           lambda_cont=args.lambda_cont)
+    baseline_desc = (f"NSK (R_max={args.r_max} Å, dR={args.dr_basis} Å, "
+                     f"M={len(baseline.R_grid)}, λ_R={args.lambda_R}, "
+                     f"λ_cont={args.lambda_cont}, ε={args.eps})")
 
     # Optional model load.
     model = None
@@ -369,7 +274,10 @@ def run_eval(args):
         print(f"R_max_data={R_max_data:.2f} Å  R_cap={args.R_cap:.2f} Å  "
               f"→ R_max={R_max:.2f} Å  B_sinc={tuple(B_sinc.shape)}")
         model  = load_model(Path(args.checkpoint), B_sinc, args.n_channels,
-                            use_conditioning=False, device=device)
+                            use_conditioning=False,
+                            use_mol_features=args.use_mol_features,
+                            mol_feature_dim=mol_feature_dim or 13,
+                            device=device)
 
     bl_mse_all   = []
     mdl_mse_all  = []
@@ -396,8 +304,15 @@ def run_eval(args):
         y_mdl = None
         if model is not None:
             with torch.no_grad():
-                pred, _ = model(sample["delta_S0_masked"].unsqueeze(0).to(device),
-                                sample["mask"].unsqueeze(0).to(device))
+                if args.use_mol_features:
+                    pred, _ = model(
+                        sample["delta_S0_masked"].unsqueeze(0).to(device),
+                        sample["mask"].unsqueeze(0).to(device),
+                        mol_features=sample["mol_features"].unsqueeze(0).to(device),
+                    )
+                else:
+                    pred, _ = model(sample["delta_S0_masked"].unsqueeze(0).to(device),
+                                    sample["mask"].unsqueeze(0).to(device))
             y_mdl = pred.cpu().numpy()[0]
             mdl_mse_all.append(masked_mse_per_sample(y_mdl[None], y_tgt[None], m[None])[0])
 
@@ -427,14 +342,20 @@ def run_eval(args):
         print(f"\nBaseline / Model masked-MSE ratio (mean): {ratio:.2f}×")
 
     if args.plot:
-        _plot_panels(plot_cache, args.plot)
-        print(f"\nWrote {args.plot}")
+        if _plot_panels(plot_cache, args.plot):
+            print(f"\nWrote {args.plot}")
+
+    if args.trajectory_heatmap:
+        if model is None:
+            raise ValueError("--trajectory-heatmap requires --checkpoint for model predictions")
+        if _plot_trajectory_heatmaps(dataset, q_np, model, device, val_files, args):
+            print(f"\nWrote {args.trajectory_heatmap}")
 
 
 def _plot_panels(samples, outpath):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    plt = _load_pyplot()
+    if plt is None:
+        return False
 
     n = len(samples)
     fig, axes = plt.subplots(n, 1, figsize=(9, 2.5 * n), sharex=True)
@@ -462,6 +383,150 @@ def _plot_panels(samples, outpath):
     axes[-1].set_xlabel(r"$q$ (Å$^{-1}$)")
     fig.tight_layout()
     fig.savefig(outpath, dpi=130)
+    return True
+
+
+def _load_pyplot():
+    tmpdir = Path(os.environ.get("TMPDIR", "/tmp"))
+    mpl_cache = tmpdir / f"matplotlib-{os.environ.get('USER', 'user')}"
+    xdg_cache = tmpdir / f"xdg-cache-{os.environ.get('USER', 'user')}"
+    mpl_cache.mkdir(parents=True, exist_ok=True)
+    xdg_cache.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_cache))
+    os.environ.setdefault("XDG_CACHE_HOME", str(xdg_cache))
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError as e:
+        if e.name != "matplotlib":
+            raise
+        print(
+            "\nSkipping plot because matplotlib is not installed. "
+            "Re-run without --plot for metrics only, or install matplotlib "
+            "in this environment."
+        )
+        return None
+    return plt
+
+
+def _plot_trajectory_heatmaps(dataset, q_np, model, device, val_files, args):
+    plt = _load_pyplot()
+    if plt is None:
+        return False
+
+    baseline = NSKBaseline(R_max=args.r_max, dR=args.dr_basis,
+                           eps=args.eps, lambda_R=args.lambda_R,
+                           lambda_cont=args.lambda_cont)
+
+    q_max = args.trajectory_heatmap_q_max or args.q_min_hi
+    q_sel = q_np < q_max
+    if not np.any(q_sel):
+        raise ValueError(f"No q points found below trajectory heatmap q max {q_max}")
+
+    rng = np.random.default_rng(args.plot_seed)
+    candidate_files = np.asarray(sorted(val_files), dtype=int)
+    n_mols = min(args.trajectory_heatmap_molecules, len(candidate_files))
+    if n_mols == 0:
+        raise ValueError("No validation molecules available for trajectory heatmap")
+    selected_files = rng.choice(candidate_files, size=n_mols, replace=False)
+
+    rows = []
+    for fi in selected_files:
+        delta = dataset._delta_S0[int(fi)]
+        ti = min(args.trajectory_heatmap_traj, delta.shape[0] - 1)
+        target = delta[ti]  # (n_frames, nq), includes frame 0
+        mask = np.ones_like(q_np, dtype=np.float32)
+        mask[q_sel] = 0.0
+        masked = target * mask[None, :]
+
+        pred_chunks = []
+        mol_features = None
+        if args.use_mol_features:
+            mol_features = torch.from_numpy(dataset._mol_features[int(fi)]).to(device)
+        with torch.no_grad():
+            for start in range(0, masked.shape[0], args.trajectory_heatmap_batch_size):
+                stop = min(start + args.trajectory_heatmap_batch_size, masked.shape[0])
+                x = torch.from_numpy(masked[start:stop].astype(np.float32)).to(device)
+                m = torch.from_numpy(np.broadcast_to(mask, x.shape).copy()).to(device)
+                if args.use_mol_features:
+                    f = mol_features.unsqueeze(0).expand(x.shape[0], -1)
+                    pred, _ = model(x, m, mol_features=f)
+                else:
+                    pred, _ = model(x, m)
+                pred_chunks.append(pred.cpu().numpy())
+        pred = np.concatenate(pred_chunks, axis=0)
+        nsk = baseline.predict(q_np, masked, np.broadcast_to(mask, masked.shape).copy())
+
+        time = np.arange(target.shape[0], dtype=np.float32)
+        try:
+            with np.load(dataset.loaded_files[int(fi)]) as d:
+                if "time_fs" in d:
+                    time = np.asarray(d["time_fs"], dtype=np.float32)[:target.shape[0]]
+        except Exception:
+            pass
+
+        rows.append({
+            "file": dataset.loaded_files[int(fi)].name,
+            "traj": ti,
+            "time": time,
+            "pred": pred[:, q_sel],
+            "nsk": nsk[:, q_sel],
+            "target": target[:, q_sel],
+            "q": q_np[q_sel],
+        })
+
+    fig, axes = plt.subplots(
+        len(rows), 3,
+        figsize=(15, max(2.6 * len(rows), 4.0)),
+        sharex=False,
+        sharey=True,
+        constrained_layout=True,
+    )
+    if len(rows) == 1:
+        axes = np.asarray([axes])
+
+    for row_idx, row in enumerate(rows):
+        pred = row["pred"].T
+        nsk = row["nsk"].T
+        target = row["target"].T
+        time = row["time"]
+        q = row["q"]
+        vmax = max(
+            float(np.max(np.abs(pred))),
+            float(np.max(np.abs(nsk))),
+            float(np.max(np.abs(target))),
+            1e-12,
+        )
+        extent = [float(time[0]), float(time[-1]), float(q[0]), float(q[-1])]
+
+        for col_idx, (arr, title) in enumerate((
+            (pred, "Model"),
+            (nsk, "NSK baseline"),
+            (target, "Ground truth"),
+        )):
+            ax = axes[row_idx, col_idx]
+            im = ax.imshow(
+                arr,
+                origin="lower",
+                aspect="auto",
+                extent=extent,
+                cmap="coolwarm",
+                vmin=-vmax,
+                vmax=vmax,
+            )
+            if row_idx == 0:
+                ax.set_title(rf"{title} $\Delta S_0^{{norm}}$")
+            if col_idx == 0:
+                ax.set_ylabel(f"{row['file']}\ntraj {row['traj']}\nq (Å$^{{-1}}$)")
+            fig.colorbar(im, ax=ax, label=r"$\Delta S_0^{norm}$")
+
+    for ax in axes[-1, :]:
+        ax.set_xlabel("time (fs)")
+
+    fig.savefig(args.trajectory_heatmap, dpi=140)
+    return True
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -471,15 +536,8 @@ if __name__ == "__main__":
     p.add_argument("--data-dir",   default="data/trajectory_data_cap200")
     p.add_argument("--checkpoint", default=None, help="Optional model checkpoint .pt for side-by-side comparison")
     p.add_argument("--n-channels", type=int, default=128, help="Must match the checkpoint's training config")
-    p.add_argument("--baseline",   choices=["poly", "nsk"], default="nsk",
-                   help="Which baseline to evaluate. 'nsk' = spherical-Bessel "
-                        "inversion + boundary-matched extrapolation (Wang et al. 2026).")
-    # Polynomial baseline params
-    p.add_argument("--n-terms",    type=int, default=3, help="(poly) number of polynomial terms")
-    p.add_argument("--parity",     choices=["even", "all"], default="even",
-                   help="(poly) 'even' → q²,q⁴,q⁶,...  'all' → q,q²,q³,...")
-    p.add_argument("--window",     type=float, default=1.5, help="(poly) fit window above q_min, Å⁻¹")
-    # NSK baseline params
+    p.add_argument("--use-mol-features", action="store_true", default=False,
+                   help="Load a scalar molecular feature-conditioned checkpoint")
     p.add_argument("--r-max",      type=float, default=10.0, help="(nsk) upper R for basis grid, Å")
     p.add_argument("--dr-basis",   type=float, default=0.1,  help="(nsk) basis grid spacing, Å")
     p.add_argument("--eps",        type=float, default=1e-3, help="(nsk) Tikhonov weight for initial inversion")
@@ -492,6 +550,16 @@ if __name__ == "__main__":
     p.add_argument("--max-samples", type=int, default=500, help="Limit val samples for quick checks")
     p.add_argument("--n-plot",     type=int, default=6, help="Number of sample panels to plot")
     p.add_argument("--plot",       default=None, help="Output path for comparison plot (PNG)")
+    p.add_argument("--trajectory-heatmap", default=None,
+                   help="Output path for trajectory heatmap PNG: prediction vs ground truth for multiple molecules")
+    p.add_argument("--trajectory-heatmap-molecules", type=int, default=4,
+                   help="Number of validation molecules to include in the trajectory heatmap")
+    p.add_argument("--trajectory-heatmap-traj", type=int, default=0,
+                   help="Trajectory index to plot for each selected molecule")
+    p.add_argument("--trajectory-heatmap-q-max", type=float, default=None,
+                   help="Upper q bound for trajectory heatmap; default uses --q-min-hi")
+    p.add_argument("--trajectory-heatmap-batch-size", type=int, default=256,
+                   help="Frame batch size for model prediction while making trajectory heatmaps")
     p.add_argument("--seed",       type=int, default=0, help="Seed for dataset q_min sampling")
     p.add_argument("--plot-seed",  type=int, default=0, help="Seed for selecting which val samples to plot")
     args = p.parse_args()

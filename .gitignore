@@ -23,3 +23,4 @@ checkpoints/
 logs/
 trajectory_data_cap200/
 optuna/
+trajectory_data_cap200_new/

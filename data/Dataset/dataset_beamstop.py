@@ -39,6 +39,7 @@ Usage
 
 import time
 import zipfile
+import zlib
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
@@ -52,7 +53,7 @@ def _load_npz_with_retry(fpath, keys, max_retries=4, backoff=1.0):
         try:
             d = np.load(fpath)
             return {k: np.asarray(d[k]) for k in keys}
-        except (zipfile.BadZipFile, OSError) as e:
+        except (zipfile.BadZipFile, OSError, zlib.error) as e:
             last_err = e
             if attempt < max_retries - 1:
                 time.sleep(backoff * (attempt + 1))
@@ -84,6 +85,7 @@ class BeamstopDataset(Dataset):
         max_atoms: int = 75,
         max_modes: int = 219,
         use_conditioning: bool = True,
+        use_mol_features: bool = False,
         seed: int | None = None,
     ):
         self.data_dir        = Path(data_dir)
@@ -92,6 +94,7 @@ class BeamstopDataset(Dataset):
         self.max_atoms       = max_atoms
         self.max_modes       = max_modes
         self.use_conditioning = use_conditioning
+        self.use_mol_features = use_mol_features
         self.rng             = np.random.default_rng(seed)
 
         self.files = sorted(self.data_dir.glob("mol_*_pd.npz"))
@@ -117,12 +120,15 @@ class BeamstopDataset(Dataset):
         self._omegas:    list[np.ndarray] = []
         self._atom_mask: list[np.ndarray] = []
         self._mode_mask: list[np.ndarray] = []
+        self._mol_features: list[np.ndarray] = []
+        self.mol_feature_mean: np.ndarray | None = None
+        self.mol_feature_std: np.ndarray | None = None
 
         n_skipped  = 0
         loaded_idx = 0
         for fpath in self.files:
             keys = ["S0", "fe"]
-            if use_conditioning:
+            if use_conditioning or use_mol_features:
                 keys += ["V_vib", "omegas_ASE"]
             try:
                 arrays = _load_npz_with_retry(fpath, keys=keys)
@@ -138,12 +144,17 @@ class BeamstopDataset(Dataset):
             S0_ref = S0[:, 0:1, :]
             self._delta_S0.append((S0 - S0_ref) / (fe[None, None, :] + 1e-12))
 
-            if use_conditioning:
+            V_raw = None
+            om_raw = None
+            n_atoms = 0
+            n_modes = 0
+            if use_conditioning or use_mol_features:
                 V_raw  = arrays["V_vib"].astype(np.float32)
                 om_raw = arrays["omegas_ASE"].astype(np.float32)
                 three_N, n_modes = V_raw.shape
                 n_atoms = three_N // 3
 
+            if use_conditioning:
                 V_pad = np.zeros((3 * max_atoms, max_modes), dtype=np.float32)
                 V_pad[:three_N, :n_modes] = V_raw
                 om_pad = np.zeros(max_modes, dtype=np.float32)
@@ -156,6 +167,9 @@ class BeamstopDataset(Dataset):
                 self._atom_mask.append(atom_mask)
                 self._mode_mask.append(mode_mask)
 
+            if use_mol_features:
+                self._mol_features.append(self._build_mol_features(fpath, om_raw, n_atoms, n_modes))
+
             n_traj, n_frames, _ = S0.shape
             for ti in range(n_traj):
                 for fr in range(1, n_frames):
@@ -167,6 +181,54 @@ class BeamstopDataset(Dataset):
             print(f"  {n_skipped} file(s) skipped due to read errors.")
         if not self.loaded_files:
             raise RuntimeError(f"No usable mol_*_pd.npz files found in {data_dir}")
+        if self.use_mol_features:
+            feats = np.stack(self._mol_features).astype(np.float32)
+            self.mol_feature_mean = feats.mean(axis=0).astype(np.float32)
+            self.mol_feature_std = feats.std(axis=0).astype(np.float32)
+            self.mol_feature_std[self.mol_feature_std < 1e-6] = 1.0
+            self._mol_features = [
+                ((f - self.mol_feature_mean) / self.mol_feature_std).astype(np.float32)
+                for f in feats
+            ]
+
+    def _build_mol_features(self, fpath: Path, omegas: np.ndarray,
+                            n_atoms: int, n_modes: int) -> np.ndarray:
+        omega = np.asarray(omegas, dtype=np.float32)
+        if omega.size:
+            omega_stats = [
+                float(np.mean(omega)),
+                float(np.std(omega)),
+                float(np.min(omega)),
+                float(np.percentile(omega, 25)),
+                float(np.median(omega)),
+                float(np.percentile(omega, 75)),
+                float(np.max(omega)),
+                float(np.mean(omega <= np.percentile(omega, 25))),
+            ]
+        else:
+            omega_stats = [0.0] * 8
+
+        r_stats = [0.0, 0.0, 0.0]
+        try:
+            with np.load(fpath) as d:
+                R_grid = np.asarray(d["R_grid"], dtype=np.float32)
+                pd_true = np.asarray(d["pd_true"], dtype=np.float32)
+            weights = pd_true.sum(axis=(0, 1))
+            total = float(weights.sum())
+            if total > 0:
+                mean_R = float((weights * R_grid).sum() / total)
+                var_R = float((weights * (R_grid - mean_R) ** 2).sum() / total)
+                max_R = float(R_grid[np.where(weights > 0)[0].max()])
+                r_stats = [mean_R, float(np.sqrt(max(var_R, 0.0))), max_R]
+        except (zipfile.BadZipFile, OSError, zlib.error, KeyError, ValueError) as e:
+            print(f"  WARNING: mol-feature R stats unavailable for {fpath.name} — {e}")
+
+        return np.asarray([
+            float(n_atoms),
+            float(n_modes),
+            *omega_stats,
+            *r_stats,
+        ], dtype=np.float32)
 
     def __len__(self) -> int:
         return len(self._index)
@@ -200,4 +262,6 @@ class BeamstopDataset(Dataset):
             sample["omegas"]    = torch.from_numpy(self._omegas[fi])
             sample["atom_mask"] = torch.from_numpy(self._atom_mask[fi])
             sample["mode_mask"] = torch.from_numpy(self._mode_mask[fi])
+        if self.use_mol_features:
+            sample["mol_features"] = torch.from_numpy(self._mol_features[fi])
         return sample

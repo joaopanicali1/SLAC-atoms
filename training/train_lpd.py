@@ -1,5 +1,7 @@
 import os
 import math
+import argparse
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -11,6 +13,7 @@ from data.Dataset.dataset_lpd import LPDDataset
 from models.learned_primal_dual import LearnedPrimalDual, build_dbt_operator
 
 PD_SCALE = 100.0  # pd_true is weighted by Z_iZ_j (max ~240); scale to O(1) for training
+PROJECT_DIR = Path(__file__).resolve().parents[1]
 
 
 def warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps):
@@ -159,10 +162,23 @@ def train(
 
 
 if __name__ == "__main__":
-    data_dir = "data/trajectory_data_cap200"
+    parser = argparse.ArgumentParser(description="Train the Learned Primal-Dual model.")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=PROJECT_DIR / "data/trajectory_data_cap200",
+        help="Directory containing mol_*_pd.npz files",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=PROJECT_DIR / "checkpoints/lpd",
+        help="Directory to save checkpoints",
+    )
+    args = parser.parse_args()
 
-    dataset = LPDDataset(data_dir)
-    print(f"Dataset: {len(dataset):,} samples from {len(dataset.files)} molecules")
+    dataset = LPDDataset(args.data_dir)
+    print(f"Dataset: {len(dataset):,} samples from {len(dataset.loaded_files)} molecules")
 
     # Build DBT operator from the dataset's q and R grids (same for all molecules).
     # M is derived from len(R_grid) directly — avoids floating point rounding errors
@@ -174,7 +190,7 @@ if __name__ == "__main__":
     A_dbt, _ = build_dbt_operator(q_np, M)
 
     # File-level train/val split so the same molecule never appears in both sets.
-    n_files = len(dataset.files)
+    n_files = len(dataset.loaded_files)
     n_val   = max(1, int(0.1 * n_files))
 
     rng = np.random.default_rng(42)
@@ -205,4 +221,9 @@ if __name__ == "__main__":
         pin_memory=True,
     )
 
-    train(train_loader=train_loader, val_loader=val_loader, A_dbt=A_dbt)
+    train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        A_dbt=A_dbt,
+        checkpoint_dir=str(args.checkpoint_dir),
+    )

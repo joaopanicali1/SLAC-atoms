@@ -1,8 +1,13 @@
 import numpy as np
+import os
 from scipy.io import loadmat
 from scipy.interpolate import PchipInterpolator, Akima1DInterpolator
 from scipy.special import spherical_jn
 from scipy.io import loadmat 
+
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.environ.get("TMPDIR", "/tmp"), f"matplotlib-{os.environ.get('USER', 'user')}"))
+os.environ.setdefault("XDG_CACHE_HOME", os.path.join(os.environ.get("TMPDIR", "/tmp"), f"xdg-cache-{os.environ.get('USER', 'user')}"))
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -13,7 +18,6 @@ from ase.db import connect as _ase_connect
 
 import re
 from pathlib import Path
-import os 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(_HERE)
@@ -842,14 +846,19 @@ def process_molecule(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default="data/mol_data",
+                        help="Directory containing mol_*_physics.npz files")
     parser.add_argument("--out-dir", default="data/trajectory_data")
     parser.add_argument("--max-frames", type=int, default=None,
                         help="Cap trajectory length (None = full slowest-mode period)")
     args = parser.parse_args()
 
-    data_dir = Path("data/mol_data")
+    data_dir = Path(args.data_dir)
     out_dir  = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Input molecule dir : {data_dir}")
+    print(f"Output trajectory dir: {out_dir}")
 
     for npz_path in sorted(data_dir.glob("*.npz")):
         result = process_molecule(

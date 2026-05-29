@@ -4,19 +4,20 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=24:00:00
+#SBATCH --time=04:00:00
 #SBATCH --partition=gpu-turing
 #SBATCH --gres=gpu:1
-#SBATCH --output=/home/research/joaop/SLAC-atoms/training/logs/train_beamstop_cond_%j.out
-#SBATCH --error=/home/research/joaop/SLAC-atoms/training/logs/train_beamstop_cond_%j.err
+#SBATCH --output=training/logs/train_beamstop_cond_%j.out
+#SBATCH --error=training/logs/train_beamstop_cond_%j.err
 
-cd /home/research/joaop/SLAC-atoms
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_DIR"
 source ~/.bashrc
 conda activate SLAC
 
 mkdir -p training/logs checkpoints/beamstop_conditioned
 
-PYTHONPATH=/home/research/joaop/SLAC-atoms \
+PYTHONPATH="$PROJECT_DIR" \
 python -u training/train_beamstop.py \
     --n-channels 128 \
     --use-conditioning \

@@ -208,6 +208,24 @@ class MolEmbedding(nn.Module):
         return self.final(x)                                    # (batch, d_cond)
 
 
+class MolFeatureEmbedding(nn.Module):
+    """Small MLP mapping normalized scalar molecular features to FiLM context."""
+
+    def __init__(self, n_features: int, d_cond: int = 64, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_features, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, d_cond),
+            nn.LayerNorm(d_cond),
+        )
+
+    def forward(self, mol_features: torch.Tensor) -> torch.Tensor:
+        return self.net(mol_features)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Encoder — q-space signal → R-space representation (FiLM-conditioned)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -301,19 +319,30 @@ class BeamstopModel(nn.Module):
     def __init__(self, B_sinc: torch.Tensor, max_atoms: int = 75,
                  max_modes: int = 219, d_atom: int = 64, d_mode: int = 128,
                  d_cond: int = 64, n_channels: int = 32, kernel_size: int = 5,
-                 use_conditioning: bool = True):
+                 use_conditioning: bool = True,
+                 use_feature_conditioning: bool = False,
+                 mol_feature_dim: int = 13):
         super().__init__()
         self.register_buffer('B_sinc', B_sinc.float())
         self.use_conditioning = use_conditioning
+        self.use_feature_conditioning = use_feature_conditioning
         nR, nq = B_sinc.shape
         self.d_cond    = d_cond
-        self.mol_embed = MolEmbedding(max_atoms, d_atom, d_mode, d_cond) if use_conditioning else None
+        self.mol_embed = (
+            MolEmbedding(max_atoms, d_atom, d_mode, d_cond)
+            if use_conditioning and not use_feature_conditioning else None
+        )
+        self.feature_embed = (
+            MolFeatureEmbedding(mol_feature_dim, d_cond)
+            if use_feature_conditioning else None
+        )
         self.encoder   = BeamstopEncoder(nq, nR, n_channels, d_cond, kernel_size)
 
     def forward(self, delta_S0_masked: torch.Tensor, mask: torch.Tensor,
                 V_vib: torch.Tensor | None = None, omegas: torch.Tensor | None = None,
                 atom_mask: torch.Tensor | None = None,
-                mode_mask: torch.Tensor | None = None
+                mode_mask: torch.Tensor | None = None,
+                mol_features: torch.Tensor | None = None,
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
@@ -324,6 +353,7 @@ class BeamstopModel(nn.Module):
         omegas          : (batch, max_modes)                required if use_conditioning
         atom_mask       : (batch, max_atoms)  bool          required if use_conditioning
         mode_mask       : (batch, max_modes)  bool          required if use_conditioning
+        mol_features    : (batch, mol_feature_dim)          required if use_feature_conditioning
 
         Returns
         -------
@@ -331,7 +361,9 @@ class BeamstopModel(nn.Module):
         delta_pd : (batch, nR) — zero-centred R-space intermediate,
                                  exposed for Tikhonov regularisation
         """
-        if self.use_conditioning:
+        if self.use_feature_conditioning:
+            mol_cond = self.feature_embed(mol_features)
+        elif self.use_conditioning:
             mol_cond = self.mol_embed(V_vib, omegas, atom_mask, mode_mask)
         else:
             mol_cond = delta_S0_masked.new_zeros(delta_S0_masked.shape[0], self.d_cond)

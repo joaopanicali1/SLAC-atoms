@@ -1,5 +1,8 @@
 import os
 import math
+import zipfile
+import zlib
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,14 +33,25 @@ def compute_dataset_R_max(data_dir_or_files, margin=1.2):
     else:
         files = list(data_dir_or_files)
 
+    n_skipped = 0
     for fpath in files:
-        d = np.load(fpath)
-        if R_grid is None:
-            R_grid = d["R_grid"]
-        nonzero = (d["pd_true"] > 0).any(axis=(0, 1))   # (nR,)
-        idx     = np.where(nonzero)[0]
+        try:
+            d = np.load(fpath)
+            if R_grid is None:
+                R_grid = d["R_grid"]
+            nonzero = (d["pd_true"] > 0).any(axis=(0, 1))   # (nR,)
+        except (zipfile.BadZipFile, OSError, zlib.error) as e:
+            print(f"  WARNING: skipping {Path(fpath).name} for R_max — {e}")
+            n_skipped += 1
+            continue
+
+        idx = np.where(nonzero)[0]
         if len(idx) > 0:
             max_R = max(max_R, float(R_grid[idx.max()]))
+    if n_skipped:
+        print(f"  {n_skipped} file(s) skipped while computing R_max.")
+    if R_grid is None:
+        raise RuntimeError("Could not compute R_max: no readable pd_true arrays found.")
     return max_R * margin
 
 
@@ -90,6 +104,8 @@ class FixedMaskSubset(Dataset):
             sample["omegas"]    = torch.from_numpy(self.dataset._omegas[fi])
             sample["atom_mask"] = torch.from_numpy(self.dataset._atom_mask[fi])
             sample["mode_mask"] = torch.from_numpy(self.dataset._mode_mask[fi])
+        if self.dataset.use_mol_features:
+            sample["mol_features"] = torch.from_numpy(self.dataset._mol_features[fi])
         return sample
 
 
@@ -105,7 +121,7 @@ def warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps):
 
 def run_epoch(model, loader, optimizer, scheduler, device,
               use_conditioning, lambda_masked, lambda_smooth, lambda_boundary,
-              lambda_pd, train=True):
+              lambda_pd, train=True, use_mol_features=False):
     model.train() if train else model.eval()
 
     total_loss = 0.0
@@ -126,6 +142,11 @@ def run_epoch(model, loader, optimizer, scheduler, device,
                     batch["omegas"].to(device),
                     batch["atom_mask"].to(device),
                     batch["mode_mask"].to(device),
+                )
+            elif use_mol_features:
+                pred, delta_pd = model(
+                    delta_S0_masked, mask,
+                    mol_features=batch["mol_features"].to(device),
                 )
             else:
                 pred, delta_pd = model(delta_S0_masked, mask)
@@ -165,11 +186,16 @@ def train(
     n_warmup_epochs=5,
     n_channels=32,
     use_conditioning=True,
+    use_mol_features=False,
+    mol_feature_dim=13,
     lambda_masked=10.0,
     lambda_smooth=1e-3,
     lambda_boundary=0.0,
     lambda_pd=0.0,
     checkpoint_dir="checkpoints/beamstop",
+    init_checkpoint=None,
+    max_runtime_seconds=None,
+    stop_buffer_seconds=600.0,
     device=None,
 ):
     if device is None:
@@ -177,6 +203,7 @@ def train(
 
     print(f"Training on {device}")
     print(f"use_conditioning : {use_conditioning}")
+    print(f"use_mol_features : {use_mol_features}")
     print(f"lambda_masked    : {lambda_masked}")
     print(f"lambda_smooth    : {lambda_smooth}")
     print(f"lambda_boundary  : {lambda_boundary}")
@@ -188,7 +215,20 @@ def train(
     model = BeamstopModel(
         B_sinc, n_channels=n_channels, kernel_size=5,
         use_conditioning=use_conditioning,
+        use_feature_conditioning=use_mol_features,
+        mol_feature_dim=mol_feature_dim,
     ).to(device)
+
+    if init_checkpoint is not None:
+        checkpoint = torch.load(init_checkpoint, map_location=device)
+        state_dict = checkpoint.get("model_state_dict", checkpoint)
+        model.load_state_dict(state_dict)
+        print(f"Initialized model weights from {init_checkpoint}")
+        if isinstance(checkpoint, dict):
+            if "epoch" in checkpoint:
+                print(f"  source epoch    : {checkpoint['epoch']}")
+            if "val_loss" in checkpoint:
+                print(f"  source val loss : {checkpoint['val_loss']:.6f}")
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters : {n_params:,}")
@@ -201,17 +241,21 @@ def train(
     n_warmup_steps  = n_warmup_epochs * steps_per_epoch
 
     scheduler = warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps)
-
     best_val_loss    = float("inf")
     epochs_no_improve = 0
+    train_t0 = time.perf_counter()
 
     for epoch in range(1, n_epochs + 1):
+        epoch_t0 = time.perf_counter()
         train_loss = run_epoch(model, train_loader, optimizer, scheduler, device,
                                use_conditioning, lambda_masked, lambda_smooth,
-                               lambda_boundary, lambda_pd, train=True)
+                               lambda_boundary, lambda_pd, train=True,
+                               use_mol_features=use_mol_features)
         val_loss   = run_epoch(model, val_loader,   optimizer, scheduler, device,
                                use_conditioning, lambda_masked, lambda_smooth,
-                               lambda_boundary, lambda_pd, train=False)
+                               lambda_boundary, lambda_pd, train=False,
+                               use_mol_features=use_mol_features)
+        epoch_seconds = time.perf_counter() - epoch_t0
 
         curr_lr = scheduler.get_last_lr()[0]
 
@@ -219,7 +263,9 @@ def train(
             f"epoch {epoch:03d}/{n_epochs} | "
             f"train loss: {train_loss:.6f} | "
             f"val loss: {val_loss:.6f} | "
-            f"lr: {curr_lr:.2e}"
+            f"lr: {curr_lr:.2e} | "
+            f"time: {epoch_seconds:.1f}s",
+            flush=True,
         )
 
         if val_loss < best_val_loss:
@@ -249,6 +295,21 @@ def train(
             "best_val_loss": best_val_loss,
         }, os.path.join(checkpoint_dir, "latest_checkpoint.pt"))
 
+        if max_runtime_seconds is not None:
+            elapsed = time.perf_counter() - train_t0
+            projected_next = elapsed + epoch_seconds + stop_buffer_seconds
+            if projected_next >= max_runtime_seconds:
+                print(
+                    "Time-budget stop triggered — returning best checkpoint "
+                    f"before walltime. elapsed={elapsed:.1f}s, "
+                    f"last_epoch={epoch_seconds:.1f}s, "
+                    f"budget={max_runtime_seconds:.1f}s, "
+                    f"buffer={stop_buffer_seconds:.1f}s, "
+                    f"best={best_val_loss:.6f}",
+                    flush=True,
+                )
+                break
+
     print(f"Training complete. Best val loss: {best_val_loss:.6f}")
     return model, best_val_loss
 
@@ -257,8 +318,10 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-channels",       type=int,   default=32,                      help="Hidden channels in encoder CNNs")
+    parser.add_argument("--data-dir",         type=str,   default="data/trajectory_data_cap200", help="Directory containing mol_*_pd.npz trajectory files")
     parser.add_argument("--checkpoint-dir",   type=str,   default="checkpoints/beamstop",  help="Directory to save checkpoints")
     parser.add_argument("--use-conditioning", action="store_true", default=False,           help="Enable FiLM conditioning on normal modes")
+    parser.add_argument("--use-mol-features", action="store_true", default=False,           help="Enable FiLM conditioning on scalar molecular features")
     parser.add_argument("--lambda-masked",    type=float, default=10.0,                    help="Upweight factor for masked (low-q) loss region")
     parser.add_argument("--lambda-smooth",    type=float, default=0.0,                     help="Smoothness penalty weight (default 0; B_sinc is band-limited by construction)")
     parser.add_argument("--R-margin",         type=float, default=1.2,                     help="Multiplicative margin on max interatomic distance for R-grid truncation")
@@ -269,17 +332,27 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers",      type=int,   default=4,                        help="DataLoader worker processes (0 disables IPC entirely — needed for large-tensor batches on some nodes)")
     parser.add_argument("--batch-size",       type=int,   default=32,                       help="Batch size for both loaders")
     parser.add_argument("--lr",               type=float, default=1e-3,                     help="Peak learning rate after warmup")
+    parser.add_argument("--n-epochs",         type=int,   default=100,                      help="Maximum training epochs")
+    parser.add_argument("--n-warmup-epochs",  type=int,   default=5,                        help="Linear LR warmup epochs")
+    parser.add_argument("--init-checkpoint",  type=str,   default=None,                     help="Initialize model weights from this checkpoint, but start a fresh optimizer/scheduler")
+    parser.add_argument("--max-runtime-min",  type=float, default=None,                     help="Stop cleanly before this many training minutes elapse")
+    parser.add_argument("--stop-buffer-min",  type=float, default=10.0,                     help="Runtime buffer minutes reserved before max runtime")
     args = parser.parse_args()
+    if args.use_conditioning and args.use_mol_features:
+        parser.error("--use-conditioning and --use-mol-features are mutually exclusive for now")
 
-    data_dir = "data/trajectory_data_cap200"
-
-    dataset = BeamstopDataset(data_dir, q_min_lo=0.5, q_min_hi=1.0,
+    dataset = BeamstopDataset(args.data_dir, q_min_lo=0.5, q_min_hi=1.0,
                               max_atoms=75, max_modes=219,
-                              use_conditioning=args.use_conditioning)
+                              use_conditioning=args.use_conditioning,
+                              use_mol_features=args.use_mol_features)
     print(
         f"Dataset: {len(dataset):,} samples from {len(dataset.loaded_files)} loaded "
         f"molecules ({len(dataset.files)} found, {len(dataset.skipped_files)} skipped)"
     )
+    mol_feature_dim = 0
+    if args.use_mol_features:
+        mol_feature_dim = len(dataset._mol_features[0])
+        print(f"mol_feature_dim  : {mol_feature_dim}")
 
     # Build data-driven R-grid: truncate to ~1.2× max interatomic distance.
     # Removes excess R-space DoF that can only fit low-q noise.
@@ -323,6 +396,8 @@ if __name__ == "__main__":
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     val_loader = DataLoader(
         FixedMaskSubset(dataset, val_idx, seed=12345),
@@ -330,14 +405,23 @@ if __name__ == "__main__":
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=4 if num_workers > 0 else None,
     )
 
     train(train_loader=train_loader, val_loader=val_loader,
           B_sinc=B_sinc,
           n_channels=args.n_channels, checkpoint_dir=args.checkpoint_dir,
           use_conditioning=args.use_conditioning,
+          use_mol_features=args.use_mol_features,
+          mol_feature_dim=mol_feature_dim,
           lambda_masked=args.lambda_masked,
           lambda_smooth=args.lambda_smooth,
           lambda_boundary=args.lambda_boundary,
           lambda_pd=args.lambda_pd,
-          lr=args.lr)
+          lr=args.lr,
+          n_epochs=args.n_epochs,
+          n_warmup_epochs=args.n_warmup_epochs,
+          init_checkpoint=args.init_checkpoint,
+          max_runtime_seconds=None if args.max_runtime_min is None else args.max_runtime_min * 60.0,
+          stop_buffer_seconds=args.stop_buffer_min * 60.0)

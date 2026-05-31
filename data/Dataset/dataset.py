@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 import numpy as np
-from ase.db import connect
+# from ase.db import connect
 
 class MolScatteringDataset(Dataset):
     """
@@ -25,39 +25,83 @@ class MolScatteringDataset(Dataset):
     def __init__(
         self,
         data_dir: str or Path,
-        db_path: str or Path,
+        # db_path: str or Path,
         flatten_traj: bool = True, # treat each (traj, frame) as independent sample
         max_atoms: int = 50, # for padding atomic numbers
-        max_modes: int = 144
+        max_modes: int = 144,
+        index_cache_path: str or Path = None,
+        preload: bool = False,
     ):
         self.data_dir = Path(data_dir)
         self.flatten_traj = flatten_traj
         self.max_atoms = max_atoms
         self.max_modes = max_modes
-        self.db = connect(str(db_path))
+        # print("Connecting to ASE db...")
+        # self.db = connect(str(db_path))
+        # print("Connected to ASE db.")
         
+        print("Scanning for files...")
         self.files = sorted(self.data_dir.glob("mol_*_pd.npz"))
+        print(f"Found {len(self.files)} files.")
         
         # build flat index: list of (file_idx, traj_idx, frame_idx)
         self._index = []
-        self._mol_features_cache = {}
+        # self._mol_features_cache = {}
         
-        for fi, fpath in enumerate(self.files):
-            data = np.load(fpath)
-            mol_idx = int(data["mol_idx"])
+        if index_cache_path and Path(index_cache_path).exists():
+            print("Loading cached index...")
+            self._index = [tuple(x) for x in np.load(index_cache_path, allow_pickle=True).tolist()]
+            print(f"Loaded {len(self._index):,} samples from cache.")
+        else:
+            for fi, fpath in enumerate(self.files):
+                if fi % 100 == 0:
+                    print(f"Indexing file {fi}/{len(self.files)}...")
+                data = np.load(fpath)
+                n_traj, n_frames, n_R = data["pd_limited"].shape
+                for ti in range(n_traj):
+                    for fr in range(n_frames):
+                        self._index.append((fi, ti, fr))
+            
+            if index_cache_path:
+                print("Saving index cache...")
+                np.save(index_cache_path, np.array(self._index))
+                print("Index cached.")
 
-            n_traj, n_frames, n_R = data["pd_limited"].shape
-            for ti in range(n_traj):
-                for fr in range(n_frames):
-                    self._index.append((fi, ti, fr))
-            if mol_idx not in self._mol_features_cache:
-                self._mol_features_cache[mol_idx] = self._compute_mol_features(mol_idx)
+        self._file_cache = {}
+        if preload:
+            print("Preloading all files into RAM...")
+            for fi, fpath in enumerate(self.files):
+                if fi % 100 == 0:
+                    print(f"  {fi}/{len(self.files)}", flush=True)
+                d = np.load(fpath)
+                # extract arrays immediately — don't store the NpzFile handle
+                self._file_cache[fi] = {
+                    "pd_limited": d["pd_limited"],
+                    "pd_true": d["pd_true"],
+                    "R_grid": d["R_grid"],
+                    "time_fs": d["time_fs"],
+                    "omegas_ASE": d["omegas_ASE"],
+                    "V_vib": d["V_vib"],
+                    "mol_idx": d["mol_idx"],
+                }
+            print("Preload complete.")
         
     def __len__(self):
         return len(self._index)
     
     def _load_file(self, fi):
-        return np.load(self.files[fi])
+        if fi not in self._file_cache:
+            d = np.load(self.files[fi])
+            self._file_cache[fi] = {
+                "pd_limited": d["pd_limited"],
+                "pd_true": d["pd_true"],
+                "R_grid": d["R_grid"],
+                "time_fs": d["time_fs"],
+                "omegas_ASE": d["omegas_ASE"],
+                "V_vib": d["V_vib"],
+                "mol_idx": d["mol_idx"],
+            }
+        return self._file_cache[fi]
     
     def _compute_mol_features(self, mol_idx: int) -> torch.Tensor:
         """
@@ -87,7 +131,7 @@ class MolScatteringDataset(Dataset):
         mol_idx = int(data["mol_idx"])
         
         pd_limited = torch.from_numpy(data["pd_limited"][ti, fr]) # (n_R,)
-        pd_true = torch.from_numpy(data["pd_true"][ti, fr]) # (n_R,)
+        pd_true = torch.log1p(torch.from_numpy(data["pd_true"][ti, fr]))
         R_grid = torch.from_numpy(data["R_grid"]) # (n_R,)
         time_fs = torch.tensor(data["time_fs"][fr], dtype=torch.float32)
 
@@ -114,7 +158,7 @@ class MolScatteringDataset(Dataset):
             "pd_true": pd_true,
             "R_grid": R_grid,
             "time_fs": time_fs,
-            "mol_features": self._mol_features_cache[mol_idx],
+            # "mol_features": self._mol_features_cache[mol_idx],
             "omegas_ASE": torch.from_numpy(omegas_padded),
             "V_vib": torch.from_numpy(V_vib_padded),
             "mode_mask": mode_mask,

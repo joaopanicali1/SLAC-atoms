@@ -91,7 +91,7 @@ class CrossAttentionBottleneck(nn.Module):
 
 class PairDensityUNet(nn.Module):
     def __init__(self,
-                 n_R: int = 1259,
+                 n_R: int = 1257,
                  features: list = [32, 64, 128, 256],
                  kernel_size: int = 3,
                  dropout: float = 0.0,
@@ -186,7 +186,7 @@ class PairDensityUNet(nn.Module):
 if __name__ == "__main__":
     # sanity check
     batch = 4
-    n_R = 1259
+    n_R = 1257
     max_atoms = 50
     max_modes = 144
     n_atoms = 20

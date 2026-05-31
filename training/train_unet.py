@@ -22,7 +22,7 @@ def warmup_cosine_schedular(optimizer, n_warmup_steps, n_total_steps):
         return 0.5 * (1.0 + math.cos(math.pi * progress))
     return LambdaLR(optimizer, lr_lambda)
 
-def run_epoch(model, loader, optimizer, scheduler, device, train=True):
+def run_epoch(model, loader, optimizer, scheduler, device, train=True, max_steps=None):
     model.train() if train else model.eval()
 
     total_loss = 0.0
@@ -31,7 +31,9 @@ def run_epoch(model, loader, optimizer, scheduler, device, train=True):
     context = torch.enable_grad() if train else torch.no_grad()
 
     with context:
-        for batch in loader:
+        for i, batch in enumerate(loader):
+            if max_steps is not None and i >= max_steps:
+                break
             pd_limited = batch["pd_limited"].to(device)
             pd_true = batch["pd_true"].to(device)
             V_vib = batch["V_vib"].to(device)
@@ -51,6 +53,8 @@ def run_epoch(model, loader, optimizer, scheduler, device, train=True):
 
             total_loss += loss.item()
             n_batches += 1
+            if i % 20 == 0:
+                print(f"  step {i}/{len(loader)} | loss {loss.item():.4f}", flush=True)
     return total_loss / n_batches
 
 def train(train_loader, val_loader, n_epochs=100, lr=1e-3, n_warmup_epochs=5, checkpoint_dir="checkpoints", device=None):
@@ -63,7 +67,7 @@ def train(train_loader, val_loader, n_epochs=100, lr=1e-3, n_warmup_epochs=5, ch
     os.makedirs("logs", exist_ok=True)
 
     model = PairDensityUNet(
-        n_R=1259,
+        n_R=1257,
         features=[32, 64, 128, 256],
         d_model=256,
         n_heads=8,
@@ -126,7 +130,7 @@ if __name__ == "__main__":
 
     dataset = MolScatteringDataset(
         data_dir=data_dir,
-        db_path=db_path,
+        # db_path=db_path,
         max_atoms=50,
         max_modes=144,
     )

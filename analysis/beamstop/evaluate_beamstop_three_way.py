@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare expanded fine-tuned, feature-conditioned, and NSK on one val subset."""
+"""Compare beamstop conditioned, beamstop unconditioned, and NSK."""
 
 from __future__ import annotations
 
@@ -20,6 +20,16 @@ from training.train_beamstop import (
     build_truncated_R_grid,
     compute_dataset_R_max,
 )
+
+
+CONDITIONED = "beamstop_conditioned"
+UNCONDITIONED = "beamstop_unconditioned"
+NSK = "NSK"
+DISPLAY_LABELS = {
+    CONDITIONED: "beamstop conditioned",
+    UNCONDITIONED: "beamstop unconditioned",
+    NSK: "NSK",
+}
 
 
 def masked_mse_np(pred: np.ndarray, target: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -80,10 +90,10 @@ def write_example_outputs(outdir: Path, stem: str, picks: list[tuple[str, dict]]
                           include_nsk_delta: bool = False) -> None:
     fields = [
         "kind", "sample_index", "mol_idx", "traj_idx", "frame_idx",
-        "feature_conditioned_mse", "expanded_finetune_mse", "NSK_mse",
+        f"{CONDITIONED}_mse", f"{UNCONDITIONED}_mse", f"{NSK}_mse",
     ]
     if include_nsk_delta:
-        fields.extend(["NSK_minus_conditioned_mse", "NSK_over_conditioned_mse"])
+        fields.extend([f"{NSK}_minus_{CONDITIONED}_mse", f"{NSK}_over_{CONDITIONED}_mse"])
 
     with (outdir / f"{stem}.csv").open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -92,8 +102,8 @@ def write_example_outputs(outdir: Path, stem: str, picks: list[tuple[str, dict]]
             row = {k: ex[k] for k in fields if k in ex}
             row["kind"] = kind
             if include_nsk_delta:
-                row["NSK_minus_conditioned_mse"] = ex["NSK_mse"] - ex["feature_conditioned_mse"]
-                row["NSK_over_conditioned_mse"] = ex["NSK_mse"] / max(ex["feature_conditioned_mse"], 1e-12)
+                row[f"{NSK}_minus_{CONDITIONED}_mse"] = ex[f"{NSK}_mse"] - ex[f"{CONDITIONED}_mse"]
+                row[f"{NSK}_over_{CONDITIONED}_mse"] = ex[f"{NSK}_mse"] / max(ex[f"{CONDITIONED}_mse"], 1e-12)
             writer.writerow(row)
 
     fig, axes = plt.subplots(len(picks), 1, figsize=(9, 3.0 * len(picks)), sharex=True)
@@ -103,24 +113,32 @@ def write_example_outputs(outdir: Path, stem: str, picks: list[tuple[str, dict]]
         q = ex["q"]
         mask = ex["mask"]
         missing = mask < 0.5
-        q_min = q[mask > 0.5].min()
-        ax.axvspan(q.min(), q_min, color="khaki", alpha=0.35, label="masked")
+        plot_region = missing.copy()
+        observed = mask > 0.5
+        if observed.any():
+            first_obs_idx = int(np.argmax(observed))
+            plot_region[first_obs_idx] = True
+            ax.axvspan(q.min(), q[first_obs_idx],
+                       color="khaki", alpha=0.35, label="masked")
+        elif missing.any():
+            ax.axvspan(q[missing].min(), q[missing].max(),
+                       color="khaki", alpha=0.35, label="masked")
         ax.plot(q, ex["target"], "k-", lw=1.2, label="ground truth")
-        ax.plot(q, np.where(missing, ex["feature_conditioned"], np.nan),
-                "C3-", lw=1.0, label="conditioned")
-        ax.plot(q, np.where(missing, ex["expanded_finetune"], np.nan),
-                "C2-", lw=1.0, alpha=0.9, label="expanded unconditioned")
-        ax.plot(q, np.where(missing, ex["NSK"], np.nan),
-                "C0-", lw=1.0, alpha=0.9, label="NSK")
+        ax.plot(q, np.where(plot_region, ex[CONDITIONED], np.nan),
+                "C3-", lw=1.0, label="beamstop conditioned")
+        ax.plot(q, np.where(plot_region, ex[UNCONDITIONED], np.nan),
+                "C2-", lw=1.0, alpha=0.9, label="beamstop unconditioned")
+        ax.plot(q, np.where(plot_region, ex[NSK], np.nan),
+                "C0-", lw=1.0, alpha=0.9, label=NSK)
         ax.set_ylabel(r"$\Delta S_0^{norm}$")
         ax.grid(alpha=0.25)
         title = (
             f"{kind}: sample={ex['sample_index']} mol={ex['mol_idx']} "
             f"traj={ex['traj_idx']} frame={ex['frame_idx']} "
-            f"conditioned MSE={ex['feature_conditioned_mse']:.3e}"
+            f"beamstop conditioned MSE={ex[f'{CONDITIONED}_mse']:.3e}"
         )
         if include_nsk_delta:
-            title += f" NSK MSE={ex['NSK_mse']:.3e}"
+            title += f" {NSK} MSE={ex[f'{NSK}_mse']:.3e}"
         ax.set_title(title, fontsize=9)
     axes[0].legend(loc="best", fontsize=8)
     axes[-1].set_xlabel("q (Å$^{-1}$)")
@@ -234,9 +252,9 @@ def main() -> None:
     sample_rows = []
     example_cache = []
     q_sse = {
-        "expanded_finetune": np.zeros_like(q_np, dtype=np.float64),
-        "feature_conditioned": np.zeros_like(q_np, dtype=np.float64),
-        "NSK": np.zeros_like(q_np, dtype=np.float64),
+        UNCONDITIONED: np.zeros_like(q_np, dtype=np.float64),
+        CONDITIONED: np.zeros_like(q_np, dtype=np.float64),
+        NSK: np.zeros_like(q_np, dtype=np.float64),
     }
     q_count = np.zeros_like(q_np, dtype=np.float64)
     sample_offset = 0
@@ -269,9 +287,9 @@ def main() -> None:
 
             inv_mask = 1.0 - mask_np
             q_count += inv_mask.sum(axis=0)
-            q_sse["expanded_finetune"] += (((direct_np - target_np) ** 2) * inv_mask).sum(axis=0)
-            q_sse["feature_conditioned"] += (((feature_np - target_np) ** 2) * inv_mask).sum(axis=0)
-            q_sse["NSK"] += (((nsk_pred - target_np) ** 2) * inv_mask).sum(axis=0)
+            q_sse[UNCONDITIONED] += (((direct_np - target_np) ** 2) * inv_mask).sum(axis=0)
+            q_sse[CONDITIONED] += (((feature_np - target_np) ** 2) * inv_mask).sum(axis=0)
+            q_sse[NSK] += (((nsk_pred - target_np) ** 2) * inv_mask).sum(axis=0)
 
             for i in range(target_np.shape[0]):
                 sample_index = sample_offset + i
@@ -280,38 +298,38 @@ def main() -> None:
                     "mol_idx": int(batch["mol_idx"][i]),
                     "traj_idx": int(batch["traj_idx"][i]),
                     "frame_idx": int(batch["frame_idx"][i]),
-                    "expanded_finetune_mse": float(batch_direct[i]),
-                    "feature_conditioned_mse": float(batch_feature[i]),
-                    "NSK_mse": float(batch_nsk[i]),
+                    f"{UNCONDITIONED}_mse": float(batch_direct[i]),
+                    f"{CONDITIONED}_mse": float(batch_feature[i]),
+                    f"{NSK}_mse": float(batch_nsk[i]),
                 })
                 example_cache.append({
                     "sample_index": sample_index,
                     "mol_idx": int(batch["mol_idx"][i]),
                     "traj_idx": int(batch["traj_idx"][i]),
                     "frame_idx": int(batch["frame_idx"][i]),
-                    "feature_conditioned_mse": float(batch_feature[i]),
-                    "expanded_finetune_mse": float(batch_direct[i]),
-                    "NSK_mse": float(batch_nsk[i]),
+                    f"{CONDITIONED}_mse": float(batch_feature[i]),
+                    f"{UNCONDITIONED}_mse": float(batch_direct[i]),
+                    f"{NSK}_mse": float(batch_nsk[i]),
                     "q": q_np.copy(),
                     "mask": mask_np[i].copy(),
                     "target": target_np[i].copy(),
-                    "expanded_finetune": direct_np[i].copy(),
-                    "feature_conditioned": feature_np[i].copy(),
-                    "NSK": nsk_pred[i].copy(),
+                    UNCONDITIONED: direct_np[i].copy(),
+                    CONDITIONED: feature_np[i].copy(),
+                    NSK: nsk_pred[i].copy(),
                 })
             sample_offset += target_np.shape[0]
 
     print(f"\n{'label':<28} {'mean':>12} {'median':>12} {'p95':>12} detail")
     print("-" * 104)
     rows = [
-        summarize("expanded_finetune", direct_losses, args.direct_checkpoint),
-        summarize("feature_conditioned", feature_losses, args.feature_checkpoint),
-        summarize("NSK", nsk_losses, f"R_max={args.nsk_r_max}, dR={args.nsk_dr_basis}"),
+        summarize(DISPLAY_LABELS[UNCONDITIONED], direct_losses, args.direct_checkpoint),
+        summarize(DISPLAY_LABELS[CONDITIONED], feature_losses, args.feature_checkpoint),
+        summarize(DISPLAY_LABELS[NSK], nsk_losses, f"R_max={args.nsk_r_max}, dR={args.nsk_dr_basis}"),
     ]
     mae_rows = {
-        "expanded_finetune": summarize("expanded_finetune", direct_mae, "MAE"),
-        "feature_conditioned": summarize("feature_conditioned", feature_mae, "MAE"),
-        "NSK": summarize("NSK", nsk_mae, "MAE"),
+        UNCONDITIONED: summarize(DISPLAY_LABELS[UNCONDITIONED], direct_mae, "MAE"),
+        CONDITIONED: summarize(DISPLAY_LABELS[CONDITIONED], feature_mae, "MAE"),
+        NSK: summarize(DISPLAY_LABELS[NSK], nsk_mae, "MAE"),
     }
     for row in rows:
         print(
@@ -343,16 +361,16 @@ def main() -> None:
         for row in sample_rows:
             mol_groups.setdefault(row["mol_idx"], []).append(row)
         with (outdir / "per_molecule_metrics.csv").open("w", newline="") as f:
-            fields = ["mol_idx", "n_samples", "expanded_finetune_mse", "feature_conditioned_mse", "NSK_mse"]
+            fields = ["mol_idx", "n_samples", f"{UNCONDITIONED}_mse", f"{CONDITIONED}_mse", f"{NSK}_mse"]
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             for mol_idx, group in sorted(mol_groups.items()):
                 writer.writerow({
                     "mol_idx": mol_idx,
                     "n_samples": len(group),
-                    "expanded_finetune_mse": float(np.mean([r["expanded_finetune_mse"] for r in group])),
-                    "feature_conditioned_mse": float(np.mean([r["feature_conditioned_mse"] for r in group])),
-                    "NSK_mse": float(np.mean([r["NSK_mse"] for r in group])),
+                    f"{UNCONDITIONED}_mse": float(np.mean([r[f"{UNCONDITIONED}_mse"] for r in group])),
+                    f"{CONDITIONED}_mse": float(np.mean([r[f"{CONDITIONED}_mse"] for r in group])),
+                    f"{NSK}_mse": float(np.mean([r[f"{NSK}_mse"] for r in group])),
                 })
 
         q_rows = []
@@ -370,7 +388,11 @@ def main() -> None:
         plt = load_pyplot()
         sample_vals = {k: np.asarray([r[f"{k}_mse"] for r in sample_rows]) for k in q_sse}
         fig, ax = plt.subplots(figsize=(7, 4))
-        ax.boxplot([sample_vals[k] for k in sample_vals], tick_labels=list(sample_vals.keys()), showfliers=False)
+        ax.boxplot(
+            [sample_vals[k] for k in sample_vals],
+            tick_labels=[DISPLAY_LABELS[k] for k in sample_vals],
+            showfliers=False,
+        )
         ax.set_yscale("log")
         positive_vals = np.concatenate([vals[vals > 0] for vals in sample_vals.values()])
         if positive_vals.size:
@@ -382,22 +404,22 @@ def main() -> None:
         plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(6, 5))
-        ax.scatter(sample_vals["NSK"], sample_vals["feature_conditioned"], s=4, alpha=0.25)
-        lim = [min(sample_vals["NSK"].min(), sample_vals["feature_conditioned"].min()),
-               max(sample_vals["NSK"].max(), sample_vals["feature_conditioned"].max())]
+        ax.scatter(sample_vals[NSK], sample_vals[CONDITIONED], s=4, alpha=0.25)
+        lim = [min(sample_vals[NSK].min(), sample_vals[CONDITIONED].min()),
+               max(sample_vals[NSK].max(), sample_vals[CONDITIONED].max())]
         ax.plot(lim, lim, "k--", lw=1)
         ax.set_xscale("log")
         ax.set_yscale("log")
         ax.set_xlabel("NSK masked MSE")
-        ax.set_ylabel("feature-conditioned masked MSE")
+        ax.set_ylabel("beamstop conditioned masked MSE")
         fig.tight_layout()
-        fig.savefig(outdir / "feature_vs_nsk_scatter.png", dpi=150)
+        fig.savefig(outdir / "beamstop_conditioned_vs_nsk_scatter.png", dpi=150)
         plt.close(fig)
 
         fig, ax = plt.subplots(figsize=(7, 4))
         q_csv = {label: np.asarray([r[f"{label}_rmse"] for r in q_rows]) for label in q_sse}
         for label, vals in q_csv.items():
-            ax.plot(q_np, vals, label=label)
+            ax.plot(q_np, vals, label=DISPLAY_LABELS[label])
         ax.set_xlim(q_np[valid].min(), q_np[valid].max())
         ax.set_xlabel("q (Å$^{-1}$)")
         ax.set_ylabel("RMSE over masked samples")
@@ -408,7 +430,7 @@ def main() -> None:
         if example_cache:
             worst = sorted(
                 example_cache,
-                key=lambda r: r["feature_conditioned_mse"],
+                key=lambda r: r[f"{CONDITIONED}_mse"],
                 reverse=True,
             )
             worst = select_distinct_trajectories(worst, n=3)
@@ -421,19 +443,19 @@ def main() -> None:
 
             nsk_gap = [
                 ex for ex in example_cache
-                if ex["NSK_mse"] > ex["feature_conditioned_mse"]
+                if ex[f"{NSK}_mse"] > ex[f"{CONDITIONED}_mse"]
             ]
             nsk_gap = sorted(
                 nsk_gap,
-                key=lambda r: r["NSK_mse"] - r["feature_conditioned_mse"],
+                key=lambda r: r[f"{NSK}_mse"] - r[f"{CONDITIONED}_mse"],
                 reverse=True,
             )
             nsk_gap = select_distinct_trajectories(nsk_gap, n=3)
             if nsk_gap:
                 write_example_outputs(
                     outdir,
-                    "conditioned_beats_nsk_examples",
-                    [(f"conditioned_beats_nsk_{i}", ex) for i, ex in enumerate(nsk_gap, start=1)],
+                    "beamstop_conditioned_beats_nsk_examples",
+                    [(f"beamstop_conditioned_beats_nsk_{i}", ex) for i, ex in enumerate(nsk_gap, start=1)],
                     plt,
                     include_nsk_delta=True,
                 )

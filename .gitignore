@@ -24,3 +24,6 @@ logs/
 trajectory_data_cap200/
 optuna/
 trajectory_data_cap200_new/
+.claude/
+.agents/
+.ipynb_checkpoints/

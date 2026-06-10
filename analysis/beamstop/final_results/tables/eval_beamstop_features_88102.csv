@@ -1,4 +1,0 @@
-label,mean,median,p95,n_samples,detail
-expanded_finetune,7.801577339705545e-06,3.983371925642132e-07,3.187069924024392e-05,50000,checkpoints/optuna_finetune_expanded/trial_0034/best_model.pt
-feature_conditioned,6.862296686449554e-06,1.0100040981342318e-06,3.088529047090559e-05,50000,checkpoints/beamstop_features_expanded/trial34_params/best_model.pt
-NSK,2.195080441388142e-05,1.853029335574477e-06,0.00010887966791369644,50000,"R_max=10.0, dR=0.1"

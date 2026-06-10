@@ -366,9 +366,11 @@ def _plot_panels(samples, outpath):
         target = s["target"]
         bl     = s["baseline"]
         mdl    = s["model"]
-        q_min  = q[m > 0.5].min()
+        observed = m > 0.5
 
-        ax.axvspan(q.min(), q_min, color="khaki", alpha=0.4, label="masked")
+        if observed.any():
+            ax.axvspan(q.min(), q[int(np.argmax(observed))],
+                       color="khaki", alpha=0.4, label="masked")
         ax.plot(q, target, "k-",  lw=1.0, label="target")
         ax.plot(q, bl,    "C0-",  lw=1.2, label="baseline")
         if mdl is not None:

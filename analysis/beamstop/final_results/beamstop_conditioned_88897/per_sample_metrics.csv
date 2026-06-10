@@ -1,4 +1,4 @@
-sample_index,mol_idx,traj_idx,frame_idx,expanded_finetune_mse,feature_conditioned_mse,NSK_mse
+sample_index,mol_idx,traj_idx,frame_idx,beamstop_unconditioned_mse,beamstop_conditioned_mse,NSK_mse
 0,2,0,1,3.0695872510477784e-09,7.745289565264102e-08,9.085747752000623e-11
 1,2,0,2,2.8425926057451534e-09,7.115453826145313e-08,1.2125619652691763e-09
 2,2,0,3,4.7801389513324466e-08,2.1195842236920726e-07,2.6218014037491903e-08

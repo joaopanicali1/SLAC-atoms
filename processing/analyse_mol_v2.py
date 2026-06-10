@@ -12,7 +12,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from itertools import combinations
-from form_factors.atomic_form_factors import ATOMIC_FORM_FACTORS
+# Waasmaier-Kirfel x-ray atomic form factors used to weight the scattering
+# signal before converting trajectories into S0 and pair-density targets.
+from processing.form_factors.atomic_form_factors import ATOMIC_FORM_FACTORS
 from ase import units as _ase_units
 from ase.db import connect as _ase_connect
 
@@ -21,7 +23,7 @@ from pathlib import Path
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(_HERE)
-DB_PATH = os.path.join(PROJECT_ROOT, "train_4M", "data0000.aselmdb")
+DB_PATH = os.path.join(PROJECT_ROOT, "data", "train_4m", "data0000.aselmdb")
 
 _DB = _ase_connect(DB_PATH)
 
@@ -846,9 +848,9 @@ def process_molecule(
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="data/mol_data",
+    parser.add_argument("--data-dir", default="data/mol_data_new",
                         help="Directory containing mol_*_physics.npz files")
-    parser.add_argument("--out-dir", default="data/trajectory_data")
+    parser.add_argument("--out-dir", default="data/trajectory_data_cap200_new")
     parser.add_argument("--max-frames", type=int, default=None,
                         help="Cap trajectory length (None = full slowest-mode period)")
     args = parser.parse_args()

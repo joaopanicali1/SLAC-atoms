@@ -10,7 +10,7 @@
 #SBATCH --output=processing/logs/pd_cap200_%j.out
 #SBATCH --error=processing/logs/pd_cap200_%j.err
 
-PROJECT_DIR="${SLURM_SUBMIT_DIR:-/home/cme290/joaop/SLAC-atoms}"
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$PROJECT_DIR"
 if [[ ! -f processing/analyse_mol_v2.py || ! -d data/mol_data_new ]]; then
     echo "ERROR: submit this job from the SLAC-atoms repo root." >&2

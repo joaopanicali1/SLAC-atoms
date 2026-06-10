@@ -18,4 +18,4 @@ conda activate SLAC
 mkdir -p training/logs
 
 PYTHONPATH="$PROJECT_DIR" \
-python -u training/train_beamstop.py
+python -u models/beamstop/training/train_beamstop.py

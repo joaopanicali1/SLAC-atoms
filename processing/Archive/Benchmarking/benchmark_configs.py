@@ -35,7 +35,7 @@ ORCA_BIN     = os.path.join(PROJECT_ROOT,
                "orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg", "orca")
 MPI_DIR      = os.path.join(PROJECT_ROOT, "openmpi-4.1.8_install")
 RESULTS_DIR  = os.path.join(PROJECT_ROOT, "processing", "Benchmarking", "configs_results")
-TRAIN_4M_DIR = os.path.join(PROJECT_ROOT, "train_4M")
+TRAIN_4M_DIR = os.path.join(PROJECT_ROOT, "data/train_4m")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 
@@ -74,7 +74,7 @@ CONFIGS = {
     # frequencies via finite differences of analytical gradients.
 }
 
-# ── Benchmark molecules (loaded from train_4M) ────────────────────────────────
+# ── Benchmark molecules (loaded from data/train_4m) ────────────────────────────────
 MOLECULES = {
     "H2O_3atoms":      _load_from_db("data0001.aselmdb", 27726),
     "CH3NO2_7atoms":   _load_from_db("data0000.aselmdb", 7),

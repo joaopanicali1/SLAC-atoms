@@ -12,7 +12,7 @@
 
 PROJECT_DIR="${SLURM_SUBMIT_DIR:-/home/cme290/joaop/SLAC-atoms}"
 cd "$PROJECT_DIR"
-if [[ ! -f training/train_beamstop.py || ! -d data/trajectory_data_cap200_new ]]; then
+if [[ ! -f models/beamstop/training/train_beamstop.py || ! -d data/trajectory_data_cap200_new ]]; then
     echo "ERROR: submit this job from the SLAC-atoms repo root." >&2
     echo "PROJECT_DIR resolved to: $PROJECT_DIR" >&2
     exit 1
@@ -23,7 +23,7 @@ conda activate SLAC-p100
 
 mkdir -p training/logs checkpoints/optuna_finetune_expanded/trial_0034
 
-PYTHONPATH="$PROJECT_DIR" python -u training/train_beamstop.py \
+PYTHONPATH="$PROJECT_DIR" python -u models/beamstop/training/train_beamstop.py \
   --data-dir data/trajectory_data_cap200_new \
   --n-channels 128 \
   --lambda-boundary 0.45026251076764284 \

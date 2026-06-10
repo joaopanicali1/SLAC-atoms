@@ -87,9 +87,9 @@ FIXED = dict(
 def objective(trial):
     import numpy as np
     from torch.utils.data import DataLoader, Subset
-    from data.Dataset.dataset_beamstop import BeamstopDataset
-    from models.beamstop import build_sinc_operator
-    from training.train_beamstop import (
+    from models.beamstop.dataset.dataset_beamstop import BeamstopDataset
+    from models.beamstop.code.beamstop import build_sinc_operator
+    from models.beamstop.training.train_beamstop import (
         train, compute_dataset_R_max, build_truncated_R_grid, FixedMaskSubset,
     )
 

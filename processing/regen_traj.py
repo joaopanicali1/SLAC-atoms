@@ -1,15 +1,18 @@
-"""
-Regenerate trajectory data from mol_data_new with a max_frames cap.
+"""Regenerate trajectory data from mol_data_new with a max_frames cap.
+
+This is a resumable local/multiprocessing wrapper around
+``processing.analyse_mol_v2.process_molecule``. Use it when you want to rebuild
+trajectory/PD/S0 files with a different frame cap without writing a new Slurm
+array script. Existing ``mol_*_pd.npz`` outputs are skipped.
 
 Usage:
-    python regenerate_trajectories.py \
+    python processing/regen_traj.py \
         --data-dir data/mol_data_new \
-        --out-dir  data/trajectory_data\
+        --out-dir  data/trajectory_data_v2 \
         --max-frames 500 \
         --workers 8
 
 Recommended: --max-frames 500  (median period = 370 frames, max = 6670)
-Skips molecules whose output .npz already exists — safe to resume after interruption.
 """
 
 import argparse

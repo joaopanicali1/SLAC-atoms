@@ -10,7 +10,7 @@
 #SBATCH --output=analysis/logs/eval_beamstop_snr_%j.out
 #SBATCH --error=analysis/logs/eval_beamstop_snr_%j.err
 
-PROJECT_DIR="${SLURM_SUBMIT_DIR:-/home/cme290/joaop/SLAC-atoms}"
+PROJECT_DIR="${SLURM_SUBMIT_DIR:-$PWD}"
 cd "$PROJECT_DIR"
 if [[ ! -f analysis/beamstop/evaluate_beamstop_snr_sensitivity.py || ! -d data/trajectory_data_cap200_new ]]; then
     echo "ERROR: submit this job from the SLAC-atoms repo root." >&2
@@ -34,5 +34,5 @@ PYTHONPATH="$PROJECT_DIR" python -u analysis/beamstop/evaluate_beamstop_snr_sens
   --batch-size 256 \
   --num-workers 0 \
   --direct-checkpoint checkpoints/optuna_finetune_expanded/trial_0034/best_model.pt \
-  --feature-checkpoint models/beamstop_final.pt \
+  --feature-checkpoint models/beamstop/code/beamstop_final.pt \
   --output-dir "${RESULT_DIR}"

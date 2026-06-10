@@ -13,9 +13,9 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from analysis.beamstop.baseline_beamstop import NSKBaseline
-from data.Dataset.dataset_beamstop import BeamstopDataset
-from models.beamstop import BeamstopModel, build_sinc_operator
-from training.train_beamstop import build_truncated_R_grid, compute_dataset_R_max
+from models.beamstop.dataset.dataset_beamstop import BeamstopDataset
+from models.beamstop.code.beamstop import BeamstopModel, build_sinc_operator
+from models.beamstop.training.train_beamstop import build_truncated_R_grid, compute_dataset_R_max
 
 
 CONDITIONED = "beamstop_conditioned"

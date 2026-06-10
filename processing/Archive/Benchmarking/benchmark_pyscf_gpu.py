@@ -34,7 +34,7 @@ from modes_lib import FUNCTIONAL, BASIS
 DISPERSION = "d3bj"   # D3BJ has analytical Hessian in gpu4pyscf; D4 does not
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DB_PATH      = os.path.join(PROJECT_ROOT, "train_4M", "data0000.aselmdb")
+DB_PATH      = os.path.join(PROJECT_ROOT, "data/train_4m", "data0000.aselmdb")
 OUT_CSV      = os.path.join(PROJECT_ROOT, "processing", "Benchmarking",
                             "benchmark_results_pyscf_gpu.csv")
 

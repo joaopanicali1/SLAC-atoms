@@ -1,0 +1,244 @@
+import os
+import math
+import argparse
+from pathlib import Path
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Subset
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+
+from models.lpd.dataset.dataset_lpd import LPDDataset
+from models.lpd.code.learned_primal_dual import LearnedPrimalDual, build_dbt_operator
+
+PD_SCALE = 100.0  # pd_true is weighted by Z_iZ_j (max ~240); scale to O(1) for training
+PROJECT_DIR = Path(__file__).resolve().parents[3]
+
+
+def warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps):
+    """Linear warmup for n_warmup_steps, then cosine decay to 0."""
+    def lr_lambda(step):
+        if step < n_warmup_steps:
+            return step / max(1, n_warmup_steps)
+        progress = (step - n_warmup_steps) / max(1, n_total_steps - n_warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+    return LambdaLR(optimizer, lr_lambda)
+
+
+def run_epoch(model, loader, optimizer, scheduler, device, train=True,
+              grad_clip=0.5):
+    model.train() if train else model.eval()
+
+    total_loss = 0.0
+    n_batches  = 0
+    n_skipped  = 0
+
+    context = torch.enable_grad() if train else torch.no_grad()
+
+    with context:
+        for batch in loader:
+            dS0     = batch["dS0"].to(device)      # (batch, nq)
+            pd_true = batch["pd_true"].to(device)  # (batch, nR)
+
+            pred = model(dS0)
+            # pd_true values are weighted by Z_iZ_j (up to ~240) making raw MSE
+            # ~45k at init, causing gradient explosion through 10 unrolled iters.
+            # Scale to O(1) before computing loss; model output is in same units.
+            loss = nn.functional.mse_loss(pred / PD_SCALE, pd_true / PD_SCALE)
+
+            if train:
+                # Skip the optimizer step on NaN/Inf loss instead of letting one
+                # bad batch corrupt the weights. With 10 unrolled iterations a
+                # single outlier can produce huge gradients; if we step on them,
+                # weights → NaN and every subsequent batch is poisoned.
+                if not torch.isfinite(loss):
+                    optimizer.zero_grad()
+                    n_skipped += 1
+                    scheduler.step()
+                    continue
+
+                optimizer.zero_grad()
+                loss.backward()
+
+                grad_norm = nn.utils.clip_grad_norm_(model.parameters(),
+                                                     max_norm=grad_clip)
+                if not torch.isfinite(grad_norm):
+                    optimizer.zero_grad()
+                    n_skipped += 1
+                    scheduler.step()
+                    continue
+
+                optimizer.step()
+                scheduler.step()
+
+            total_loss += loss.item()
+            n_batches  += 1
+
+    if train and n_skipped:
+        print(f"  WARN: skipped {n_skipped} batches due to NaN/Inf loss or gradient")
+    return total_loss / max(1, n_batches)
+
+
+def train(
+    train_loader,
+    val_loader,
+    A_dbt,
+    n_epochs=100,
+    lr=5e-4,
+    n_warmup_epochs=5,
+    grad_clip=0.5,
+    checkpoint_dir="models/lpd/code/checkpoints",
+    device=None,
+):
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"Training on {device}")
+    print(f"lr={lr}  grad_clip={grad_clip}  PD_SCALE={PD_SCALE}")
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
+
+    model = LearnedPrimalDual(
+        A_dbt=A_dbt,
+        n_primal=5,
+        n_dual=5,
+        n_iter=10,
+        n_channels=32,
+        kernel_size=5,
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {n_params:,}")
+    print(f"A_dbt shape: {tuple(A_dbt.shape)}  ({A_dbt.nbytes / 1e6:.1f} MB)")
+
+    optimizer = AdamW(model.parameters(), lr=lr)
+
+    steps_per_epoch = len(train_loader)
+    n_total_steps   = n_epochs * steps_per_epoch
+    n_warmup_steps  = n_warmup_epochs * steps_per_epoch
+
+    scheduler = warmup_cosine_scheduler(optimizer, n_warmup_steps, n_total_steps)
+
+    best_val_loss = float("inf")
+
+    for epoch in range(1, n_epochs + 1):
+        train_loss = run_epoch(model, train_loader, optimizer, scheduler, device,
+                               train=True,  grad_clip=grad_clip)
+        val_loss   = run_epoch(model, val_loader,   optimizer, scheduler, device,
+                               train=False, grad_clip=grad_clip)
+
+        curr_lr = scheduler.get_last_lr()[0]
+
+        print(
+            f"epoch {epoch:03d}/{n_epochs} | "
+            f"train loss: {train_loss:.6f} | "
+            f"val loss: {val_loss:.6f} | "
+            f"lr: {curr_lr:.2e}"
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": val_loss,
+            }, os.path.join(checkpoint_dir, "best_model.pt"))
+            print(f"  New best model saved (val loss = {val_loss:.6f})")
+
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "val_loss": val_loss,
+            "best_val_loss": best_val_loss,
+        }, os.path.join(checkpoint_dir, "latest_checkpoint.pt"))
+
+    print(f"Training complete. Best val loss: {best_val_loss:.6f}")
+    return model
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train the Learned Primal-Dual model.")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=PROJECT_DIR / "data/trajectory_data_cap200_new",
+        help="Directory containing mol_*_pd.npz files",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=PROJECT_DIR / "models/lpd/code/checkpoints",
+        help="Directory to save checkpoints",
+    )
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--no-pin-memory", action="store_true")
+    parser.add_argument("--n-epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--n-warmup-epochs", type=int, default=5)
+    parser.add_argument("--grad-clip", type=float, default=0.5)
+    args = parser.parse_args()
+
+    dataset = LPDDataset(args.data_dir)
+    print(f"Dataset: {len(dataset):,} samples from {len(dataset.loaded_files)} molecules")
+
+    # Build DBT operator from the dataset's q and R grids (same for all molecules).
+    # M is derived from len(R_grid) directly — avoids floating point rounding errors
+    # that arise from computing dR via R_grid[1]-R_grid[0] (Bessel-zero grid, not uniform).
+    q_np = dataset.q.numpy()
+    R_np = dataset.R_grid.numpy()
+    M    = len(R_np) + 1   # nR = M-1, so M = nR + 1
+    print(f"Building A_dbt (M={M}) ...")
+    A_dbt, _ = build_dbt_operator(q_np, M)
+
+    # File-level train/val split so the same molecule never appears in both sets.
+    n_files = len(dataset.loaded_files)
+    n_val   = max(1, int(0.1 * n_files))
+
+    rng = np.random.default_rng(42)
+    file_indices = np.arange(n_files)
+    rng.shuffle(file_indices)
+    split_dir = PROJECT_DIR / "data" / "splits"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    np.save(split_dir / "split_lpd.npy", file_indices)
+
+    val_files   = set(file_indices[:n_val])
+    train_files = set(file_indices[n_val:])
+
+    train_idx = [i for i, (fi, _, _) in enumerate(dataset._index) if fi in train_files]
+    val_idx   = [i for i, (fi, _, _) in enumerate(dataset._index) if fi in val_files]
+
+    print(f"Train samples: {len(train_idx):,}  |  Val samples: {len(val_idx):,}")
+
+    train_loader = DataLoader(
+        Subset(dataset, train_idx),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=not args.no_pin_memory,
+        persistent_workers=(args.num_workers > 0),
+    )
+    val_loader = DataLoader(
+        Subset(dataset, val_idx),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=not args.no_pin_memory,
+        persistent_workers=(args.num_workers > 0),
+    )
+
+    train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        A_dbt=A_dbt,
+        n_epochs=args.n_epochs,
+        lr=args.lr,
+        n_warmup_epochs=args.n_warmup_epochs,
+        grad_clip=args.grad_clip,
+        checkpoint_dir=str(args.checkpoint_dir),
+    )

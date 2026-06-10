@@ -29,7 +29,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ORCA_BIN     = os.path.join(PROJECT_ROOT,
                "orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg", "orca")
 MPI_WRAPPER  = os.path.join(PROJECT_ROOT, "processing", "orca_mpi_wrapper.sh")
-DB_PATH      = os.path.join(PROJECT_ROOT, "train_4M", "data0000.aselmdb")
+DB_PATH      = os.path.join(PROJECT_ROOT, "data/train_4m", "data0000.aselmdb")
 
 # (target_atoms, sample_idx, db_id)
 BENCHMARK_MOLECULES = {

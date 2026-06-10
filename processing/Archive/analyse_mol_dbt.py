@@ -119,7 +119,7 @@ from ase.data import atomic_numbers
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _HERE        = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(_HERE)
-DB_PATH      = os.path.join(PROJECT_ROOT, "train_4M", "data0000.aselmdb")
+DB_PATH      = os.path.join(PROJECT_ROOT, "data/train_4m", "data0000.aselmdb")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

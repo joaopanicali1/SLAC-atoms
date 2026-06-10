@@ -115,7 +115,7 @@ cd ${PROJECT_DIR}
 source ~/.bashrc
 conda activate ${CONDA_ENV}
 
-PYTHONPATH=${PROJECT_DIR} python -u training/train_beamstop.py \\
+PYTHONPATH=${PROJECT_DIR} python -u models/beamstop/training/train_beamstop.py \\
   --n-channels ${n_channels} \\
   --lambda-boundary ${lambda_boundary} \\
   --lambda-pd ${lambda_pd} \\

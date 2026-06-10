@@ -1,0 +1,1 @@
+"""Beamstop training package."""

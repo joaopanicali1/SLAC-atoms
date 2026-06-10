@@ -4,7 +4,7 @@
 The second bottom-row panel shows the normalized delta S0 signal used by the
 beamstop model before low-q masking augmentation. The two right-most panels show
 frame-relative differences of ``pd_limited``. The raw ``pd_limited`` array is
-the same resolution-limited PD-like input returned by ``data/Dataset/dataset.py``.
+the same resolution-limited PD-like input returned by ``models/unet/dataset/dataset.py``.
 """
 
 from __future__ import annotations

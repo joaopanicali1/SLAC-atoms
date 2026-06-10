@@ -10,9 +10,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from data.Dataset.dataset_beamstop import BeamstopDataset
-from models.beamstop import BeamstopModel, build_sinc_operator
-from training.train_beamstop import (
+from models.beamstop.dataset.dataset_beamstop import BeamstopDataset
+from models.beamstop.code.beamstop import BeamstopModel, build_sinc_operator
+from models.beamstop.training.train_beamstop import (
     FixedMaskSubset,
     build_truncated_R_grid,
     compute_dataset_R_max,

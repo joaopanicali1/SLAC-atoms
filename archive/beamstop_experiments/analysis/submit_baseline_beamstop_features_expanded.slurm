@@ -26,7 +26,7 @@ mkdir -p analysis/logs analysis/figures
 PYTHONPATH="$PROJECT_DIR" python -u analysis/baseline_beamstop.py \
   --data-dir data/trajectory_data_cap200_new \
   --use-mol-features \
-  --checkpoint checkpoints/beamstop_features_expanded/trial34_params/best_model.pt \
+  --checkpoint models/beamstop/code/checkpoints/trial34_params/best_model.pt \
   --n-channels 128 \
   --R-cap 9.451833630105082 \
   --max-samples 50000 \

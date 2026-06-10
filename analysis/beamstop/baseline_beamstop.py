@@ -211,7 +211,7 @@ def masked_mse_per_sample(pred: np.ndarray, target: np.ndarray,
 def load_model(checkpoint_path: Path, B_sinc: torch.Tensor, n_channels: int,
                 use_mol_features: bool,
                 mol_feature_dim: int, device: torch.device):
-    from models.beamstop import BeamstopModel
+    from models.beamstop.code.beamstop import BeamstopModel
     model = BeamstopModel(B_sinc, n_channels=n_channels,
                           use_feature_conditioning=use_mol_features,
                           mol_feature_dim=mol_feature_dim).to(device)
@@ -224,9 +224,9 @@ def load_model(checkpoint_path: Path, B_sinc: torch.Tensor, n_channels: int,
 
 
 def run_eval(args):
-    from data.Dataset.dataset_beamstop import BeamstopDataset
-    from models.beamstop import build_sinc_operator
-    from training.train_beamstop import compute_dataset_R_max, build_truncated_R_grid
+    from models.beamstop.dataset.dataset_beamstop import BeamstopDataset
+    from models.beamstop.code.beamstop import build_sinc_operator
+    from models.beamstop.training.train_beamstop import compute_dataset_R_max, build_truncated_R_grid
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

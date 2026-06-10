@@ -18,7 +18,7 @@ conda activate SLAC
 mkdir -p training/logs checkpoints/beamstop_conditioned
 
 PYTHONPATH="$PROJECT_DIR" \
-python -u training/train_beamstop.py \
+python -u models/beamstop/training/train_beamstop.py \
     --n-channels 128 \
     --use-conditioning \
     --lambda-masked 10.0 \

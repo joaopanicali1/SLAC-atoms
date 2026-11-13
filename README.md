@@ -2,13 +2,14 @@
 
 Tools for generating synthetic molecular trajectories, converting them into
 pair-density and scattering data, training reconstruction models, and evaluating
-low-q beamstop recovery against the NSK baseline.
+low-q beamstop recovery and full pair-density recovery against the natural
+scattering kernel (NSK) baseline (Natan, Phys. Rev. A 107, 023105 (2023)).
 
 The repository is organized around five workflows:
 
 1. Extract normal modes from OMol/data/train_4m structures.
 2. Generate trajectory, pair-density (PD), and scattering (`S0`) datasets.
-3. Train the UNet, learned primal-dual (LPD), and beamstop models.
+3. Train the UNet, learned primal-dual (LPD v1 and v2), and beamstop models.
 4. Generate evaluation metrics and figures.
 5. Load the best checkpoints for downstream inference.
 
@@ -39,9 +40,11 @@ models/
     training/        beamstop training script and Slurm submit file
     dataset/         BeamstopDataset
   lpd/
-    code/            LearnedPrimalDual implementation
-    training/        LPD training script and Slurm submit file
-    dataset/         LPDDataset
+    code/            LearnedPrimalDual (v1) and LearnedPrimalDualV2 + final .pt files
+    training/        LPD v1/v2 training scripts and Slurm submit files
+    dataset/         LPDDataset (v1) and LPDv2Dataset
+  nsk/
+    code/            NSK-l1 as published (Natan, PRA 2023): exact lasso path + L-curve
   unet/
     code/            PairDensityUNet and committed .pt files
     training/        UNet training script and Slurm submit file
@@ -49,7 +52,8 @@ models/
 
 analysis/
   beamstop/          final beamstop metrics, figures, and sensitivity analyses
-  pd_recovery/       UNet/classical full-PD recovery metrics and figures
+  pd_recovery/       full-PD recovery: LPD v2 vs DBT/Tikhonov/NSK benchmark,
+                     NSK paper Fig. 3 benchmark, older UNet/classical comparisons
 
 archive/
   engine_validation/ historical B3LYP validation molecules/results
@@ -225,6 +229,36 @@ sbatch models/lpd/training/submit_train_lpd.slurm
 The LPD model maps `dS0(q) -> pd_true(R)` using a fixed DBT operator plus
 learned unrolled updates.
 
+### Learned Primal-Dual v2
+
+LPD v2 recovers the normalised pair density `p(R) = pd_true(R) / sum_{a<b} Z_a Z_b`
+from `S0(q)` measured over any q-range (random beamstop `q_min` during training).
+Compared with v1 it uses the Debye equation as its forward operator, takes the
+analysis window as an input so data consistency is only enforced at measured q,
+starts from a Tikhonov solution, predicts a non-negative unit-mass output, and is
+trained with a Wasserstein (W1) loss. The module docstring of
+`models/lpd/code/learned_primal_dual_v2.py` explains each change.
+
+It was trained on the original 662-molecule set `data/trajectory_data_cap200`
+with `data/splits/split_lpd.npy`, the same set and split as LPD v1 (the beamstop
+model uses the expanded `trajectory_data_cap200_new`).
+
+```bash
+sbatch models/lpd/training/submit_train_lpd_v2.slurm   # 8 GPUs (torchrun + DDP), --resume
+```
+
+Single device:
+
+```bash
+python models/lpd/training/train_lpd_v2.py \
+  --data-dir data/trajectory_data_cap200 \
+  --split data/splits/split_lpd.npy \
+  --checkpoint-dir models/lpd/code/checkpoints/lpd_v2
+```
+
+The released checkpoint `models/lpd/code/lpd_v2_final.pt` is epoch 8 of that run
+(best clean validation W1).
+
 ### Beamstop
 
 Final beamstop training used the expanded cap200 dataset, molecular scalar
@@ -294,12 +328,40 @@ analysis/beamstop/final_results/qmin_sensitivity_<job_id>/
 analysis/beamstop/final_results/snr_sensitivity_<job_id>/
 ```
 
-Full pair-density recovery comparisons for UNet and classical baselines are
-kept in:
+### Pair-density recovery (LPD v2)
 
-```text
-analysis/pd_recovery/
+The benchmark harness `analysis/pd_recovery/eval_pd_recovery.py` scores DBT,
+Tikhonov, NSK-l1 as published (L-curve and tuned epsilon), LPD v1 and LPD v2 on
+all 66 validation molecules of `split_lpd.npy` (20 frames each), in three
+noise-free conditions:
+
+```bash
+mkdir -p analysis/logs
+for i in 0 1 2; do sbatch --job-name=eval_pd_$i analysis/pd_recovery/submit_eval_pd.slurm $i; done
+# 0 clean (q = 0-10 1/A), 1 beamstop q_min = 0.8 1/A, 2 Delta PD = PD(t) - PD(0)
 ```
+
+Median results (R^2 after blurring prediction and truth by sigma = 0.025 / 0.05 / 0.1 A;
+W1 in A):
+
+| Condition | Tikhonov | NSK-l1 (paper) | LPD v2 |
+|---|---|---|---|
+| Clean | 0.52 / 0.73 / 0.91, W1 0.074 | 0.21 / 0.69 / 0.92, W1 0.099 | 0.74 / 0.90 / 0.98, W1 0.037 |
+| Beamstop 0.8 | 0.22 / 0.34 / 0.47, W1 2.16 | 0.16 / 0.61 / 0.87, W1 0.270 | 0.73 / 0.90 / 0.98, W1 0.043 |
+
+The NSK paper's own super-resolution test (its Fig. 3: two pair distances
+approaching each other, with detector-pixel noise) is reproduced for NSK and
+LPD v2 by:
+
+```bash
+sbatch analysis/pd_recovery/submit_nsk_fig3.slurm
+```
+
+Results and figures are in `analysis/pd_recovery/results/lpd_v2/`; see
+`analysis/pd_recovery/README.md`.
+
+Older full pair-density recovery comparisons for UNet and classical baselines
+are also kept in `analysis/pd_recovery/`.
 
 ## 5. Load Best Checkpoints
 
@@ -377,6 +439,40 @@ model = LearnedPrimalDual(A_dbt)
 ckpt = torch.load("models/lpd/code/lpd_final.pt", map_location="cpu")
 model.load_state_dict(ckpt["model_state_dict"])
 model.eval()
+```
+
+### Learned Primal-Dual v2
+
+```python
+import numpy as np
+import torch
+from models.lpd.code.learned_primal_dual_v2 import LearnedPrimalDualV2, process_scattering
+
+ckpt = torch.load("models/lpd/code/lpd_v2_final.pt", map_location="cpu")
+model = LearnedPrimalDualV2(ckpt["q"], ckpt["R_grid"], **ckpt["config"])
+model.load_state_dict(ckpt["model_state_dict"])
+model.eval()
+
+d = np.load("data/trajectory_data_cap200/mol_XXXXXX_pd.npz")
+S0 = torch.tensor(d["S0"][0, :4])                       # 4 frames, (B, nq)
+B = len(S0)
+ss = torch.tensor(d["self_scatter"]).expand(B, -1)
+fe = torch.tensor(d["fe"]).expand(B, -1)
+q_min = torch.full((B,), 0.8)                           # beamstop edge [1/A]; 0 = full range
+dS0, W = process_scattering(S0, ss, fe, torch.tensor(d["q"]), q_min)
+with torch.no_grad():
+    p_hat, _ = model(dS0, W)                            # normalised PD on R_grid, (B, nR)
+```
+
+### NSK-l1 (paper baseline)
+
+```python
+from models.nsk.code.nsk import NSK
+
+# q (nq,), W (nq,) analysis window, x (n, nq) processed signal dS0, all numpy float64
+nsk = NSK(q, W, 0.1)                           # dictionary spacing 0.1 A, as in the paper
+stems, info = nsk.solve(x, positive=True)      # p = w/2 at nsk.R; epsilon at the L-curve corner
+p = nsk.to_grid(stems, R_grid + dR / 2)        # onto the 0.025 A bins (dR = 0.025)
 ```
 
 ## Notes on Data Curation
